@@ -289,9 +289,16 @@ pub(crate) fn white_space_collapse(input: stylo::WhiteSpaceCollapse) -> parley::
     }
 }
 
+/// Convert a stylo computed style into a parley text style.
+///
+/// `normal_line_height` is the resolved pixel height for `line-height: normal`, as
+/// returned by [`crate::font_metrics::resolve_normal_line_height`]. It is passed in rather
+/// than resolved here because parley's `TreeBuilder` borrows the `FontContext` exclusively
+/// for its whole lifetime, which is exactly when this conversion runs.
 pub(crate) fn style(
     span_id: NodeId,
     style: &stylo::ComputedValues,
+    normal_line_height: Option<f32>,
 ) -> parley::TextStyle<'static, 'static, TextBrush> {
     let font_styles = style.get_font();
     let itext_styles = style.get_inherited_text();
@@ -299,7 +306,12 @@ pub(crate) fn style(
     // Convert font size and line height
     let font_size = font_styles.font_size.used_size.0.px();
     let line_height = match font_styles.line_height {
-        stylo::LineHeight::Normal => parley::LineHeight::FontSizeRelative(1.2),
+        stylo::LineHeight::Normal => normal_line_height.map_or(
+            // No font in the family list resolved to a real face; fall back to a rough
+            // multiple of the font size.
+            parley::LineHeight::FontSizeRelative(1.2),
+            parley::LineHeight::Absolute,
+        ),
         stylo::LineHeight::Number(num) => parley::LineHeight::FontSizeRelative(num.0),
         stylo::LineHeight::Length(value) => parley::LineHeight::Absolute(value.0.px()),
     };
