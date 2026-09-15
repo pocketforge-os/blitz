@@ -10,7 +10,7 @@ use style::{
 
 use crate::{
     color::{ToColorColor as _, contrast_ratio},
-    kurbo_css::Edge,
+    kurbo_css::{CssBox, Edge},
     render::{ElementCx, PhysicalTracks},
 };
 
@@ -101,6 +101,48 @@ fn dashed_ratios(thickness: f64, scale: f64) -> (f64, f64) {
         (2.0, 1.0)
     } else {
         (3.0, 2.0)
+    }
+}
+
+/// Fill `pieces`, grouping identical colours into a single path so that adjacent
+/// same-coloured regions are rasterised together and no antialiasing seam appears
+/// between them.
+fn fill_grouped_by_color(
+    scene: &mut impl PaintScene,
+    transform: kurbo::Affine,
+    mut pieces: SmallVec<[(Color, BezPath); 8]>,
+) {
+    if pieces.is_empty() {
+        return;
+    }
+
+    pieces.sort_unstable_by(|a, b| {
+        a.0.components
+            .partial_cmp(&b.0.components)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut start = 0;
+    while start < pieces.len() {
+        let color = pieces[start].0;
+        let mut path = std::mem::take(&mut pieces[start].1);
+        let mut next = start + 1;
+        while next < pieces.len() && pieces[next].0 == color {
+            path.extend(&pieces[next].1);
+            next += 1;
+        }
+        scene.fill(Fill::NonZero, transform, color, None, &path);
+        start = next;
+    }
+}
+
+/// The border width (in device pixels) of a single edge of `frame`.
+fn edge_width(frame: &CssBox, edge: Edge) -> f64 {
+    match edge {
+        Edge::Top => frame.border_width.y0,
+        Edge::Bottom => frame.border_width.y1,
+        Edge::Left => frame.border_width.x0,
+        Edge::Right => frame.border_width.x1,
     }
 }
 
@@ -254,8 +296,12 @@ impl ElementCx<'_, '_> {
 
                 // Dashed and dotted edges are drawn immediately as their own
                 // (clipped) shapes rather than being batched with the solid edges.
-                BorderStyle::Dotted => self.draw_dotted_border_edge(scene, edge, color),
-                BorderStyle::Dashed => self.draw_dashed_border_edge(scene, edge, color),
+                BorderStyle::Dotted => {
+                    self.draw_dotted_border_edge(scene, &self.frame, edge, color)
+                }
+                BorderStyle::Dashed => {
+                    self.draw_dashed_border_edge(scene, &self.frame, edge, color)
+                }
 
                 // A double border is two solid lines separated by a gap, splitting
                 // the border width into three equal parts (outer line / gap / inner
@@ -314,40 +360,12 @@ impl ElementCx<'_, '_> {
             }
         }
 
-        if borders.is_empty() {
-            return;
-        }
-
-        // Group together identical colors by sorting, then fill each group as a
-        // single path.
-        borders.sort_unstable_by(|a, b| {
-            a.0.components
-                .partial_cmp(&b.0.components)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut start = 0;
-        while start < borders.len() {
-            let color = borders[start].0;
-            let mut path = std::mem::take(&mut borders[start].1);
-            let mut next = start + 1;
-            while next < borders.len() && borders[next].0 == color {
-                path.extend(&borders[next].1);
-                next += 1;
-            }
-            scene.fill(Fill::NonZero, self.transform, color, None, &path);
-            start = next;
-        }
+        fill_grouped_by_color(scene, self.transform, borders);
     }
 
     /// The border width (in device pixels) of a single edge.
     fn edge_width(&self, edge: Edge) -> f64 {
-        match edge {
-            Edge::Top => self.frame.border_width.y0,
-            Edge::Bottom => self.frame.border_width.y1,
-            Edge::Left => self.frame.border_width.x0,
-            Edge::Right => self.frame.border_width.x1,
-        }
+        edge_width(&self.frame, edge)
     }
 
     /// Draw a single `dashed` border edge.
@@ -357,8 +375,14 @@ impl ElementCx<'_, '_> {
     /// to the edge's region (the same trapezoid used by the solid path) so corners
     /// are mitred, adjacent edges of different colors don't overlap, and any
     /// border-radius is respected.
-    fn draw_dashed_border_edge(&self, scene: &mut impl PaintScene, edge: Edge, color: Color) {
-        let thickness = self.edge_width(edge);
+    fn draw_dashed_border_edge(
+        &self,
+        scene: &mut impl PaintScene,
+        frame: &CssBox,
+        edge: Edge,
+        color: Color,
+    ) {
+        let thickness = edge_width(frame, edge);
         if thickness <= 0.0 {
             return;
         }
@@ -366,13 +390,13 @@ impl ElementCx<'_, '_> {
         let (dash_ratio, gap_ratio) = dashed_ratios(thickness, self.scale);
 
         // Work out the centre line to stroke and the dash/gap lengths along it.
-        let (centerline, dash, gap) = if self.frame.has_border_radius() {
+        let (centerline, dash, gap) = if frame.has_border_radius() {
             // Rounded corners: stroke the rounded centre line running through the
             // whole perimeter. Every edge uses the same centre line and pattern, so
             // dashes stay continuous and aligned as they wrap around each corner.
             // Dash and gap keep their ratio, sized so a whole number of periods fit
             // exactly around the perimeter (kurbo merges the dash across the seam).
-            let mut centerline = self.frame.border_slice(0.0, 0.5).padding_box_path();
+            let mut centerline = frame.border_slice(0.0, 0.5).padding_box_path();
             centerline.close_path();
             let perimeter = centerline.perimeter(0.1);
             if perimeter <= 0.0 {
@@ -387,7 +411,7 @@ impl ElementCx<'_, '_> {
             // Square corners: stroke a straight line through the middle of the edge,
             // corner to corner. Dash and gap keep their ratio but are scaled so the
             // edge both starts and ends with a dash (covering the corners).
-            let bb = self.frame.border_box;
+            let bb = frame.border_box;
             let half = thickness / 2.0;
             let (start, end, length) = match edge {
                 Edge::Top => (
@@ -430,7 +454,7 @@ impl ElementCx<'_, '_> {
         let stroke = Stroke::new(thickness)
             .with_caps(Cap::Butt)
             .with_dashes(0.0, [dash, gap]);
-        let clip = self.frame.border_edge_shape(edge);
+        let clip = frame.border_edge_shape(edge);
         scene.push_clip_layer(self.transform, &clip);
         scene.stroke(&stroke, self.transform, color, None, &centerline);
         scene.pop_layer();
@@ -443,18 +467,24 @@ impl ElementCx<'_, '_> {
     /// (so a round-capped dash pattern would render nothing); drawing them
     /// explicitly also lets us anchor a dot in each square corner. Everything is
     /// clipped to the edge's region, as for the other styles.
-    fn draw_dotted_border_edge(&self, scene: &mut impl PaintScene, edge: Edge, color: Color) {
-        let thickness = self.edge_width(edge);
+    fn draw_dotted_border_edge(
+        &self,
+        scene: &mut impl PaintScene,
+        frame: &CssBox,
+        edge: Edge,
+        color: Color,
+    ) {
+        let thickness = edge_width(frame, edge);
         if thickness <= 0.0 {
             return;
         }
         let radius = thickness / 2.0;
 
         let mut path = BezPath::new();
-        if self.frame.has_border_radius() {
+        if frame.has_border_radius() {
             // Rounded corners: dots spaced evenly around the rounded centre line so
             // the ring wraps seamlessly around the corners.
-            let mut centerline = self.frame.border_slice(0.0, 0.5).padding_box_path();
+            let mut centerline = frame.border_slice(0.0, 0.5).padding_box_path();
             centerline.close_path();
             let perimeter = centerline.perimeter(0.1);
             if perimeter <= 0.0 {
@@ -469,7 +499,7 @@ impl ElementCx<'_, '_> {
             // Square corners: a dot is anchored in each corner (both ends of the
             // edge, inset by the radius so it sits snugly in the corner) and the
             // rest are spread evenly between them.
-            let bb = self.frame.border_box;
+            let bb = frame.border_box;
             let length = match edge {
                 Edge::Top | Edge::Bottom => bb.width(),
                 Edge::Left | Edge::Right => bb.height(),
@@ -503,7 +533,7 @@ impl ElementCx<'_, '_> {
             }
         }
 
-        let clip = self.frame.border_edge_shape(edge);
+        let clip = frame.border_edge_shape(edge);
         scene.push_clip_layer(self.transform, &clip);
         scene.fill(Fill::NonZero, self.transform, color, None, &path);
         scene.pop_layer();
@@ -608,44 +638,108 @@ impl ElementCx<'_, '_> {
         }
     }
 
-    /// ❌ dotted - Defines a dotted border
-    /// ❌ dashed - Defines a dashed border
-    /// ✅ solid - Defines a solid border
-    /// ❌ double - Defines a double border
-    /// ❌ groove - Defines a 3D grooved border. The effect depends on the border-color value
-    /// ❌ ridge - Defines a 3D ridged border. The effect depends on the border-color value
-    /// ❌ inset - Defines a 3D inset border. The effect depends on the border-color value
-    /// ❌ outset - Defines a 3D outset border. The effect depends on the border-color value
-    /// ✅ none - Defines no border
-    /// ✅ hidden - Defines a hidden border
+    /// Draw the element's outline.
+    ///
+    /// css-ui-4 §3.3 defines `outline-style` as `auto | <outline-line-style>`, where
+    /// `<outline-line-style>` "accepts the same values as `<line-style>` with the same
+    /// meaning, except that `hidden` is not a legal outline style". The outline is
+    /// therefore painted with the same per-edge painters as the corresponding
+    /// `border-style`, over a frame whose border *is* the outline
+    /// ([`CssBox::outline_as_border`]) so that `outline-offset` (§3.5) and any
+    /// `border-radius` are already baked into its geometry.
+    ///
+    /// `auto` is left to the caller's discretion and currently draws nothing; §3.3
+    /// permits a user agent to "treat `auto` as `solid`".
     pub(crate) fn draw_outline(&self, scene: &mut impl PaintScene) {
         let outline = self.style.get_outline();
-
-        let current_color = self.style.clone_color();
-        let color = outline
-            .outline_color
-            .resolve_to_absolute(&current_color)
-            .as_srgb_color();
 
         let style = match outline.outline_style {
             OutlineStyle::Auto => return,
             OutlineStyle::BorderStyle(style) => style,
         };
 
-        let path = match style {
-            BorderStyle::None | BorderStyle::Hidden => return,
-            BorderStyle::Solid => self.frame.outline(),
+        // `hidden` is not a legal outline style (§3.3), but the computed value shares
+        // `border-style`'s type, so guard both keywords. Either way nothing is drawn.
+        if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
+            return;
+        }
+        if self.frame.outline_width <= 0.0 {
+            return;
+        }
 
-            // TODO: Implement other border styles
-            BorderStyle::Inset
-            | BorderStyle::Groove
-            | BorderStyle::Outset
-            | BorderStyle::Ridge
-            | BorderStyle::Dotted
-            | BorderStyle::Dashed
-            | BorderStyle::Double => self.frame.outline(),
-        };
+        let current_color = self.style.clone_color();
+        let color = outline
+            .outline_color
+            .resolve_to_absolute(&current_color)
+            .as_srgb_color();
+        if color.components[3] <= 0.0 {
+            return;
+        }
 
-        scene.fill(Fill::NonZero, self.transform, color, None, &path);
+        // A solid outline is one uniform ring, so it is drawn as a single two-contour
+        // annulus rather than four abutting edge shapes: one fill, and no antialiasing
+        // seam along the corner miters.
+        if style == BorderStyle::Solid {
+            scene.fill(
+                Fill::NonZero,
+                self.transform,
+                color,
+                None,
+                &self.frame.outline(),
+            );
+            return;
+        }
+
+        let ring = self.frame.outline_as_border();
+        let thickness = self.frame.outline_width;
+
+        // Patterned styles are drawn (and clipped) one edge at a time, exactly as the
+        // matching border style is.
+        if matches!(style, BorderStyle::Dashed | BorderStyle::Dotted) {
+            for &edge in &[Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
+                match style {
+                    BorderStyle::Dashed => self.draw_dashed_border_edge(scene, &ring, edge, color),
+                    BorderStyle::Dotted => self.draw_dotted_border_edge(scene, &ring, edge, color),
+                    _ => unreachable!(),
+                }
+            }
+            return;
+        }
+
+        // The remaining styles are solid fills that differ only in how the ring is
+        // sliced and shaded. Same-coloured pieces are collected into one path and
+        // filled together so adjacent regions don't leave an antialiasing seam.
+        let mut pieces: SmallVec<[(Color, BezPath); 8]> = SmallVec::new();
+        for &edge in &[Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
+            match style {
+                // Two solid rings separated by a gap, splitting the outline width into
+                // three equal parts. Below 3px there is no room for that, so it falls
+                // back to solid, as a `double` border does.
+                BorderStyle::Double => {
+                    if thickness < 3.0 * self.scale {
+                        pieces.push((color, ring.border_edge_shape(edge)));
+                    } else {
+                        let mut path = ring.border_slice(0.0, 1.0 / 3.0).border_edge_shape(edge);
+                        path.extend(&ring.border_slice(2.0 / 3.0, 1.0).border_edge_shape(edge));
+                        pieces.push((color, path));
+                    }
+                }
+                BorderStyle::Inset | BorderStyle::Outset => {
+                    let inset = style == BorderStyle::Inset;
+                    let shade = beveled_edge_color(color, edge, inset);
+                    pieces.push((shade, ring.border_edge_shape(edge)));
+                }
+                BorderStyle::Groove | BorderStyle::Ridge => {
+                    let ridge = style == BorderStyle::Ridge;
+                    let (outer, inner) = grooved_edge_colors(color, edge, ridge);
+                    pieces.push((outer, ring.border_slice(0.0, 0.5).border_edge_shape(edge)));
+                    pieces.push((inner, ring.border_slice(0.5, 1.0).border_edge_shape(edge)));
+                }
+                // Solid, dashed, dotted, none and hidden all returned above.
+                _ => unreachable!(),
+            }
+        }
+
+        fill_grouped_by_color(scene, self.transform, pieces);
     }
 }

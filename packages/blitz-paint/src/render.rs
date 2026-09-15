@@ -440,7 +440,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         let mut clip_path_for_layer = clip_path_shape.unwrap_or(default_clip);
         clip_path_for_layer.apply_affine(Affine::scale(self.scale));
 
-        cx.draw_outline(scene);
         cx.draw_outset_box_shadow(scene);
 
         // clip-path clip ayer
@@ -556,6 +555,15 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 cx.maybe_pop_css_mask_layer(scene, mask_layer_pushed);
             },
         );
+
+        // The outline goes last. css-ui-4 §3.1: "The outline created with the outline
+        // properties is drawn 'over' a box, i.e., the outline is always on top", which
+        // CSS 2.2 Appendix E spells out as drawing outlines on top of everything painted
+        // in steps 1-7 of the stacking context. Painted before the background instead --
+        // as it was -- an outline with a negative `outline-offset` sits inside the border
+        // box and is covered by the element's own background, so a `:focus` ring drawn
+        // inside its control disappears entirely.
+        cx.draw_outline(scene);
     }
 
     fn render_node(
@@ -1183,7 +1191,11 @@ fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBo
     let border_box = Rect::new(0.0, 0.0, width * scale, height * scale);
     let border = insets_from_taffy_rect(layout.border.map(|p| p as f64 * scale));
     let padding = insets_from_taffy_rect(layout.padding.map(|p| p as f64 * scale));
-    let outline_width = style.get_outline().outline_width.0.to_f64_px() * scale;
+    let outline = style.get_outline();
+    let outline_width = outline.outline_width.0.to_f64_px() * scale;
+    // css-ui-4 §3.5. The offset is a plain computed <length>, so it scales with the
+    // rest of the box.
+    let outline_offset = outline.outline_offset.to_f64_px() * scale;
 
     // Resolve the radii to a length. need to downscale since the radii are in document pixels
     let resolve_w = CSSPixelLength::new(width as _);
@@ -1202,5 +1214,12 @@ fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBo
         bottom_left: resolve_radii(&s_border.border_bottom_left_radius),
     };
 
-    CssBox::new(border_box, border, padding, outline_width, border_radii)
+    CssBox::new(
+        border_box,
+        border,
+        padding,
+        outline_width,
+        outline_offset,
+        border_radii,
+    )
 }

@@ -35,11 +35,38 @@ pub struct CssBox {
     pub content_box: Rect,
     pub outline_box: Rect,
 
+    /// The inner edge of the outline: the border box displaced by `outline-offset`.
+    /// Equal to `border_box` at the initial offset of `0`.
+    pub outline_inner_box: Rect,
+
     pub padding_width: Insets,
     pub border_width: Insets,
     pub outline_width: f64,
+    /// `outline-offset`: the distance between the border edge and the inner edge of
+    /// the outline (css-ui-4 §3.5). Positive values push the outline away from the
+    /// box, negative values draw it inside the border box.
+    pub outline_offset: f64,
 
     pub border_radii: NonUniformRoundedRectRadii,
+}
+
+/// The `outline-offset` to apply on each axis, clamped per css-ui-4 §3.5:
+///
+/// > Negative values must cause the outline to shrink into the border box. Both the
+/// > height and the width of the outside of the shape drawn by the outline should not
+/// > become smaller than twice the computed value of the `outline-width` property to make
+/// > sure that an outline can be rendered even with large negative values. User agents
+/// > should apply this constraint independently in each dimension.
+///
+/// The outer edge of the outline measures `border_box + 2 × (offset + width)` in each
+/// dimension, so keeping it at or above `2 × width` means `offset ≥ -border_box / 2`.
+/// Without the clamp a large negative offset inverts the rect and the ring turns inside
+/// out.
+fn clamped_outline_offset(border_box: Rect, outline_offset: f64) -> Vec2 {
+    Vec2 {
+        x: outline_offset.max(-border_box.width() / 2.0),
+        y: outline_offset.max(-border_box.height() / 2.0),
+    }
 }
 
 impl CssBox {
@@ -48,11 +75,20 @@ impl CssBox {
         border: Insets,
         padding: Insets,
         outline_width: f64,
+        outline_offset: f64,
         mut border_radii: NonUniformRoundedRectRadii,
     ) -> Self {
         let padding_box = border_box - border;
         let content_box = padding_box - padding;
-        let outline_box = border_box.inset(outline_width);
+        // css-ui-4 §3.5: the outline is drawn starting just outside the border edge,
+        // outset from it by `outline-offset`, and a negative offset shrinks it into
+        // the border box. So the outline occupies the ring between the border box
+        // displaced by the offset (`outline_inner_box`) and that same rect grown by
+        // `outline-width` (`outline_box`).
+        let offset = clamped_outline_offset(border_box, outline_offset);
+        let outline_inner_box =
+            border_box.inset(Insets::new(offset.x, offset.y, offset.x, offset.y));
+        let outline_box = outline_inner_box.inset(outline_width);
 
         // Correct the border radii if they are too big if two border radii would intersect, then we need to shrink
         // ALL border radii by the same factor such that they do not
@@ -79,11 +115,60 @@ impl CssBox {
             border_box,
             content_box,
             outline_box,
+            outline_inner_box,
             outline_width,
+            outline_offset,
             padding_width: padding,
             border_width: border,
             border_radii,
         }
+    }
+
+    /// The `outline-offset` actually applied on each axis, after the css-ui-4 §3.5
+    /// minimum-size clamp. See [`clamped_outline_offset`].
+    fn outline_offsets(&self) -> Vec2 {
+        clamped_outline_offset(self.border_box, self.outline_offset)
+    }
+
+    /// This box's outline expressed as a *border*: a [`CssBox`] whose border box is the
+    /// outer edge of the outline and whose border is the outline itself.
+    ///
+    /// css-ui-4 §3.3 defines `<outline-line-style>` as accepting "the same values as
+    /// `<line-style>` with the same meaning", so every patterned outline style is drawn
+    /// by the same per-edge painters that draw the corresponding border style, over this
+    /// frame. Its padding box is [`Self::outline_inner_box`] and its corner radii are the
+    /// concentric radii of the outline's outer edge, so the two models agree exactly.
+    pub fn outline_as_border(&self) -> CssBox {
+        let offset = self.outline_offsets();
+        let grow = |radius: Vec2| {
+            let outer = Vec2 {
+                x: radius.x + offset.x + self.outline_width,
+                y: radius.y + offset.y + self.outline_width,
+            };
+            // Mirrors [`Self::is_sharp`]: a corner whose border radius is zero on either
+            // axis is square, and stays square however far out the outline is drawn -- a
+            // square box does not grow rounded corners just because it has an outline. A
+            // negative offset that eats the radius entirely squares the corner too.
+            if radius.x == 0.0 || radius.y == 0.0 || outer.x <= 0.0 || outer.y <= 0.0 {
+                Vec2::ZERO
+            } else {
+                outer
+            }
+        };
+        let radii = NonUniformRoundedRectRadii {
+            top_left: grow(self.border_radii.top_left),
+            top_right: grow(self.border_radii.top_right),
+            bottom_right: grow(self.border_radii.bottom_right),
+            bottom_left: grow(self.border_radii.bottom_left),
+        };
+        CssBox::new(
+            self.outline_box,
+            Insets::uniform(self.outline_width),
+            Insets::ZERO,
+            0.0,
+            0.0,
+            radii,
+        )
     }
 
     /// Construct a BezPath representing one edge of a box's border.
@@ -191,20 +276,26 @@ impl CssBox {
             slice_border,
             Insets::ZERO,
             0.0,
+            0.0,
             slice_radii,
         )
     }
 
-    /// Construct a bezpath drawing the outline
+    /// Construct a bezpath drawing the outline: the ring between the outline's inner
+    /// edge (the border edge displaced by `outline-offset`) and its outer edge.
     pub fn outline(&self) -> BezPath {
         let mut path = BezPath::new();
 
         // TODO: this has been known to produce quirky outputs with hugely rounded edges
         self.shape(&mut path, CssBoxKind::OutlineBox, Direction::Clockwise);
-        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::BorderBox));
+        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::OutlineInnerBox));
 
-        self.shape(&mut path, CssBoxKind::BorderBox, Direction::Anticlockwise);
-        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::BorderBox));
+        self.shape(
+            &mut path,
+            CssBoxKind::OutlineInnerBox,
+            Direction::Anticlockwise,
+        );
+        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::OutlineInnerBox));
 
         path
     }
@@ -325,6 +416,7 @@ impl CssBox {
     fn corner(&self, corner: Corner, css_box: CssBoxKind) -> Point {
         let Rect { x0, y0, x1, y1 } = match css_box {
             CssBoxKind::OutlineBox => self.outline_box,
+            CssBoxKind::OutlineInnerBox => self.outline_inner_box,
             CssBoxKind::BorderBox => self.border_box,
             CssBoxKind::PaddingBox => self.padding_box,
             CssBoxKind::ContentBox => self.content_box,
@@ -506,7 +598,19 @@ impl CssBox {
         }
 
         let css_box: Insets = match side {
-            OutlineBox => return false,
+            // Both outline edges are the border edge displaced by `outline-offset`
+            // (plus the outline width, for the outer one). A negative offset can eat a
+            // corner radius entirely, leaving a square corner.
+            OutlineBox => {
+                let offset = self.outline_offsets();
+                let grown = |radius: f64, offset: f64| radius + offset + self.outline_width;
+                return grown(corner_radii.x, offset.x) <= 0.0
+                    || grown(corner_radii.y, offset.y) <= 0.0;
+            }
+            OutlineInnerBox => {
+                let offset = self.outline_offsets();
+                return corner_radii.x + offset.x <= 0.0 || corner_radii.y + offset.y <= 0.0;
+            }
             BorderBox => return false,
             PaddingBox => self.border_width,
             ContentBox => add_insets(self.border_width, self.padding_width),
@@ -565,7 +669,24 @@ impl CssBox {
 
         let radii: Vec2 = match side {
             BorderBox => corner_radii,
-            OutlineBox => corner_radii + Vec2::new(self.outline_width, self.outline_width),
+            // Concentric with the border edge: each outline edge's corner radius is the
+            // border radius plus the distance from the border edge out to that edge,
+            // floored at zero (css-ui-4 §3.1, "to the extent that the outline follows
+            // the border edge, it should follow the border-radius curve").
+            OutlineBox => {
+                let offset = self.outline_offsets();
+                Vec2 {
+                    x: (corner_radii.x + offset.x + self.outline_width).max(0.0),
+                    y: (corner_radii.y + offset.y + self.outline_width).max(0.0),
+                }
+            }
+            OutlineInnerBox => {
+                let offset = self.outline_offsets();
+                Vec2 {
+                    x: (corner_radii.x + offset.x).max(0.0),
+                    y: (corner_radii.y + offset.y).max(0.0),
+                }
+            }
             PaddingBox => corner_radii - get_corner_insets(*border_width, corner),
             ContentBox => {
                 corner_radii - get_corner_insets(add_insets(*border_width, *padding_width), corner)
@@ -694,6 +815,7 @@ mod tests {
             Insets::uniform(10.0),
             Insets::ZERO,
             0.0,
+            0.0,
             NonUniformRoundedRectRadii {
                 top_left: Vec2::new(60.0, 20.0),
                 top_right: Vec2::new(20.0, 50.0), // ry > rx
@@ -788,6 +910,7 @@ fn detects_elliptical_border() {
             Insets::uniform(1.0),
             Insets::ZERO,
             0.0,
+            0.0,
             radii,
         )
     };
@@ -815,6 +938,7 @@ fn detects_uniform_corner_border() {
             Rect::new(0.0, 0.0, w, h),
             Insets::uniform(1.0),
             Insets::ZERO,
+            0.0,
             0.0,
             radii,
         )
