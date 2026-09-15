@@ -79,9 +79,8 @@ fn node_list_item_child(
         ListStylePosition::Inside => ListItemLayoutPosition::Inside,
         ListStylePosition::Outside => {
             let mut font_ctx = doc.font_ctx.lock().unwrap();
-            let normal_line_height =
-                crate::font_metrics::resolve_normal_line_height(&mut font_ctx, &styles);
-            let mut parley_style = stylo_to_parley::style(child_id, &styles, normal_line_height);
+            let normal_strut = crate::font_metrics::resolve_normal_strut(&mut font_ctx, &styles);
+            let mut parley_style = stylo_to_parley::style(child_id, &styles, normal_strut);
 
             if let Some(font_family) = font_for_bullet_style(list_style_type) {
                 parley_style.font_family = font_family;
