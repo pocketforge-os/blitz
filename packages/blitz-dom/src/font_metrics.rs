@@ -24,12 +24,17 @@ impl core::fmt::Debug for BlitzFontMetricsProvider {
     }
 }
 
-/// Resolve `line-height: normal` for `font_styles`, the way Blink does.
+/// The strut for `line-height: normal`: the ascent and descent of `font_styles`' first
+/// available font at `font_size`, as positive distances from the baseline.
 ///
-/// Blink takes the *primary* font's ascent and descent, rounds each to a whole CSS pixel
-/// (`FontMetrics::AscentDescentWithHacks` -> `SkScalarRoundToScalar`), and uses their sum
-/// as the strut height (`FontMetrics::FloatHeight()`; the line gap is deliberately
-/// excluded). Gecko and WebKit resolve `normal` from font metrics too.
+/// Browsers resolve `normal` from font metrics rather than from a multiple of the font size.
+/// Blink takes the ascent and descent, rounds each to a whole CSS pixel
+/// (`FontMetrics::AscentDescentWithHacks` -> `SkScalarRoundToScalar`), and sums them with the
+/// line gap excluded (`FontMetrics::FloatHeight()`). Gecko and WebKit resolve `normal` from
+/// font metrics too. The rounding and the sum are parley's to apply, because on a
+/// `line-height: normal` line the strut is only one of the contributions: CSS Inline Layout 3
+/// §5.3 unions it with the metrics of every *other* font the line's runs resolved to, and only
+/// parley knows what those are.
 ///
 /// Approximating `normal` as a fixed multiple of the font size is off by up to a pixel per
 /// line box for fonts whose ascent + descent happens to be near that multiple, and off
@@ -38,11 +43,11 @@ impl core::fmt::Debug for BlitzFontMetricsProvider {
 ///
 /// Returns `None` when no font in the family list resolves to a real face, in which case
 /// the caller keeps its previous approximation.
-fn normal_line_height(
+fn normal_strut(
     font_ctx: &mut FontContext,
     font_styles: &FontStyles,
     font_size: f32,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
     use parley::fontique::{Attributes, QueryFont, QueryStatus};
     use skrifa::instance::{LocationRef, Size};
     use skrifa::metrics::Metrics;
@@ -86,22 +91,39 @@ fn normal_line_height(
     );
 
     // `Metrics::descent` points down the y axis, so it is negative.
-    Some(metrics.ascent.round() + (-metrics.descent).round())
+    Some((metrics.ascent, -metrics.descent))
 }
 
-/// Resolve `line-height: normal` for `style`, if that is what `line-height` computes to.
+/// The first available font's strut for `style`, whatever its `line-height` computes to.
 ///
-/// Returns `None` for every other `line-height` value: those need no font metrics.
-pub(crate) fn resolve_normal_line_height(
+/// Every block container generates a strut on each of its line boxes -- "an imaginary inline
+/// box with the font and line-height of the block" (CSS 2.1 §10.8.1) -- so a block's own font
+/// bounds its lines even where no glyph is drawn from that font.
+pub(crate) fn first_available_font_strut(
     font_ctx: &mut FontContext,
     style: &ComputedValues,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
+    let font_styles = style.get_font();
+    let font_size = font_styles.font_size.used_size.0.px();
+    normal_strut(font_ctx, font_styles, font_size)
+}
+
+/// Resolve the `line-height: normal` strut for `style`, if that is what `line-height`
+/// computes to.
+///
+/// Returns `None` for every other `line-height` value: those need no font metrics, and on
+/// those lines the metrics of a fallback font must not affect the line box at all
+/// (CSS Inline Layout 3 §5.3).
+pub(crate) fn resolve_normal_strut(
+    font_ctx: &mut FontContext,
+    style: &ComputedValues,
+) -> Option<(f32, f32)> {
     let font_styles = style.get_font();
     if !matches!(font_styles.line_height, LineHeight::Normal) {
         return None;
     }
     let font_size = font_styles.font_size.used_size.0.px();
-    normal_line_height(font_ctx, font_styles, font_size)
+    normal_strut(font_ctx, font_styles, font_size)
 }
 
 impl FontMetricsProvider for BlitzFontMetricsProvider {
