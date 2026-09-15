@@ -44,14 +44,40 @@ use std::sync::Arc;
 use anyrender::Scene;
 use blitz_dom::node::RasterImageData;
 
+/// Identifies a tile, for use as a cache key.
+///
+/// Two tiles are the same when they come from the same parsed tree and are wanted at the same
+/// size. The key **owns** a reference to the tree, which is what makes it sound: an
+/// address-based identity is only stable while the address cannot be recycled, and holding
+/// the `Arc` guarantees that for as long as the cache entry lives.
+#[derive(Clone, Debug)]
+pub struct SvgTileKey {
+    tree: Arc<usvg::Tree>,
+    width: u32,
+    height: u32,
+}
+
+impl PartialEq for SvgTileKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && Arc::ptr_eq(&self.tree, &other.tree)
+    }
+}
+
+impl Eq for SvgTileKey {}
+
+impl std::hash::Hash for SvgTileKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.tree) as usize).hash(state);
+        self.width.hash(state);
+        self.height.hash(state);
+    }
+}
+
 /// One tile `blitz-paint` would like rasterised.
 pub struct SvgTileRequest<'a> {
     /// The tile's source tree.
-    ///
-    /// This is the cache key. Two requests naming the same `Arc` at the same size are the
-    /// same tile, and a cache that holds an `Arc` clone keeps the address unique for as long
-    /// as the entry lives -- so `Arc::as_ptr(tree) as usize` is a sound key *provided* the
-    /// entry owns a clone.
     pub tree: &'a Arc<usvg::Tree>,
     /// The tile's drawing commands, already scaled so that the tree fills
     /// `width` x `height` exactly.
@@ -65,6 +91,19 @@ pub struct SvgTileRequest<'a> {
     pub width: u32,
     /// Tile height in whole device pixels.
     pub height: u32,
+}
+
+impl SvgTileRequest<'_> {
+    /// A hashable, owning identity for this tile, suitable as the key of a cache that
+    /// outlives the call. Using this rather than a raw pointer keeps the tree alive, so the
+    /// identity cannot be recycled underneath the entry.
+    pub fn cache_key(&self) -> SvgTileKey {
+        SvgTileKey {
+            tree: self.tree.clone(),
+            width: self.width,
+            height: self.height,
+        }
+    }
 }
 
 /// Rasterises a repeating SVG background tile on `blitz-paint`'s behalf.

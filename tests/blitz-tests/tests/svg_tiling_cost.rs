@@ -13,7 +13,9 @@ use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_dom::node::{ImageData, RasterImageData, SvgImageData};
 use blitz_html::{HtmlDocument, HtmlProvider};
-use blitz_paint::{SvgTileRasterizer, SvgTileRequest, paint_scene, paint_scene_with_tiles};
+use blitz_paint::{
+    SvgTileKey, SvgTileRasterizer, SvgTileRequest, paint_scene, paint_scene_with_tiles,
+};
 use blitz_traits::shell::{ColorScheme, Viewport};
 use kurbo::Affine;
 use std::cell::RefCell;
@@ -170,17 +172,12 @@ fn build(w: u32, h: u32, el_h: u32) -> HtmlDocument {
 /// same renderer that draws the scene, and cache across frames.
 #[derive(Default)]
 struct CachingRasterizer {
-    cache: RefCell<HashMap<(usize, u32, u32), RasterImageData>>,
-    keepalive: RefCell<Vec<Arc<usvg::Tree>>>,
+    cache: RefCell<HashMap<SvgTileKey, RasterImageData>>,
 }
 
 impl SvgTileRasterizer for CachingRasterizer {
     fn rasterize_svg_tile(&self, request: SvgTileRequest<'_>) -> Option<RasterImageData> {
-        let key = (
-            Arc::as_ptr(request.tree) as usize,
-            request.width,
-            request.height,
-        );
+        let key = request.cache_key();
         if let Some(hit) = self.cache.borrow().get(&key) {
             return Some(hit.clone());
         }
@@ -191,7 +188,6 @@ impl SvgTileRasterizer for CachingRasterizer {
             request.height,
         );
         let image = RasterImageData::new(request.width, request.height, Arc::new(pixels));
-        self.keepalive.borrow_mut().push(request.tree.clone());
         self.cache.borrow_mut().insert(key, image.clone());
         Some(image)
     }

@@ -16,7 +16,9 @@ use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_dom::node::{ImageData, RasterImageData, SvgImageData};
 use blitz_html::{HtmlDocument, HtmlProvider};
-use blitz_paint::{SvgTileRasterizer, SvgTileRequest, paint_scene, paint_scene_with_tiles};
+use blitz_paint::{
+    SvgTileKey, SvgTileRasterizer, SvgTileRequest, paint_scene, paint_scene_with_tiles,
+};
 use blitz_traits::shell::{ColorScheme, Viewport};
 use kurbo::Affine;
 use std::cell::RefCell;
@@ -39,9 +41,7 @@ const BLOB: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height=
 /// "`blitz-paint` never asked" from "it asked and then rejected the tile".
 #[derive(Default)]
 struct CachingRasterizer {
-    cache: RefCell<HashMap<(usize, u32, u32), RasterImageData>>,
-    /// Keeps each cached tree alive, so its `Arc` address stays a unique key.
-    keepalive: RefCell<Vec<Arc<usvg::Tree>>>,
+    cache: RefCell<HashMap<SvgTileKey, RasterImageData>>,
     requests: RefCell<u32>,
     rasterizations: RefCell<u32>,
 }
@@ -59,17 +59,12 @@ fn rasterize(request: &SvgTileRequest<'_>) -> RasterImageData {
 impl SvgTileRasterizer for CachingRasterizer {
     fn rasterize_svg_tile(&self, request: SvgTileRequest<'_>) -> Option<RasterImageData> {
         *self.requests.borrow_mut() += 1;
-        let key = (
-            Arc::as_ptr(request.tree) as usize,
-            request.width,
-            request.height,
-        );
+        let key = request.cache_key();
         if let Some(hit) = self.cache.borrow().get(&key) {
             return Some(hit.clone());
         }
         *self.rasterizations.borrow_mut() += 1;
         let image = rasterize(&request);
-        self.keepalive.borrow_mut().push(request.tree.clone());
         self.cache.borrow_mut().insert(key, image.clone());
         Some(image)
     }

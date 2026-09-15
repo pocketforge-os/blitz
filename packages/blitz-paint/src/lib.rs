@@ -23,7 +23,7 @@ use blitz_dom::{BaseDocument, NodeId, util::Color};
 use render::BlitzDomPainter;
 
 #[cfg(feature = "svg")]
-pub use svg_tile::{SvgTileRasterizer, SvgTileRequest};
+pub use svg_tile::{SvgTileKey, SvgTileRasterizer, SvgTileRequest};
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
