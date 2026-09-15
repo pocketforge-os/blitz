@@ -290,25 +290,16 @@ impl ElementCx<'_, '_> {
         (viewport_rect, transform)
     }
 
-    /// The region of `transform`'s local space that can land on the render surface.
+    /// The render surface, in the coordinates a fill's transform maps into.
     ///
-    /// Anything a fill places outside the surface is discarded by the backend, so this is
-    /// the largest area worth emitting tiles for. Returned as an axis-aligned bound, which
-    /// is exact for the translation/scale transforms backgrounds normally carry and
-    /// conservative (too large, never too small) under rotation or skew. A non-invertible
-    /// transform collapses the element to nothing, so nothing is culled and the caller's
-    /// own geometry decides.
-    fn paintable_area(&self, transform: Affine) -> Rect {
-        let surface = Rect::new(
-            0.0,
-            0.0,
-            self.context.width as f64,
-            self.context.height as f64,
-        );
-        if transform.determinant() == 0.0 {
-            return surface;
-        }
-        transform.inverse().transform_rect_bbox(surface)
+    /// `paint_scene` offsets the whole document by `initial_x`/`initial_y`, so the surface
+    /// occupies that offset plus the viewport size in this space -- the same correction
+    /// `render_element` makes before its own cull check.
+    fn surface_rect(&self) -> Rect {
+        Rect::from_origin_size(
+            (self.context.initial_x, self.context.initial_y),
+            (self.context.width as f64, self.context.height as f64),
+        )
     }
 
     /// Whether this element or any of its ancestors has a CSS transform
@@ -521,38 +512,43 @@ impl ElementCx<'_, '_> {
 
         let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
 
-        // The part of the layer that can reach the render surface, in the same local
-        // coordinates the tiling is computed in.
-        let visible_rect = self.paintable_area(base_transform);
-
-        let x = gradient_axis_tiling(
+        let mut x = gradient_axis_tiling(
             *repeat_x,
-            GradientAxis {
-                origin_start: origin_rect.x0,
-                origin_len: origin_rect.width(),
-                clip_start: clip_rect.x0,
-                clip_len: clip_rect.width(),
-                visible_start: visible_rect.x0,
-                visible_len: visible_rect.width(),
-                bg_pos: bg_pos.x,
-                tile_len: bg_size.width,
-            },
+            origin_rect.x0,
+            origin_rect.width(),
+            clip_rect.x0,
+            clip_rect.width(),
+            bg_pos.x,
+            bg_size.width,
         );
-        let y = gradient_axis_tiling(
+        let mut y = gradient_axis_tiling(
             *repeat_y,
-            GradientAxis {
-                origin_start: origin_rect.y0,
-                origin_len: origin_rect.height(),
-                clip_start: clip_rect.y0,
-                clip_len: clip_rect.height(),
-                visible_start: visible_rect.y0,
-                visible_len: visible_rect.height(),
-                bg_pos: bg_pos.y,
-                tile_len: bg_size.height,
-            },
+            origin_rect.y0,
+            origin_rect.height(),
+            clip_rect.y0,
+            clip_rect.height(),
+            bg_pos.y,
+            bg_size.height,
         );
-
         let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
+
+        // Drop the tiles that cannot land on the render surface. Without this the tile count
+        // scales with the element's own extent, so a tall page costs time proportional to its
+        // height rather than to the pixels actually being produced.
+        //
+        // Tile `i` is drawn as `base_transform.then_translate(translate + i * stride)` over
+        // `tile_rect`, and `then_translate` adds to the transform's *output* translation, so
+        // the lattice steps along the surface axes while `tile_rect` itself carries the
+        // transform's linear part. Both facts are used here: the tile's surface-space extent
+        // is the bounding box of `base_transform * tile_rect`, and the per-tile offset is
+        // added to it directly. Deriving the bound in the layer's own space instead -- by
+        // inverting the transform -- describes a different set of tiles the moment that
+        // linear part is not the identity, and drops tiles the lattice still needs.
+        let tile_bbox = base_transform.transform_rect_bbox(tile_rect);
+        let surface = self.surface_rect();
+        cull_axis_to_surface(&mut x, tile_bbox.x0, tile_bbox.x1, surface.x0, surface.x1);
+        cull_axis_to_surface(&mut y, tile_bbox.y0, tile_bbox.y1, surface.y0, surface.y1);
+
         let current_color = self.style.clone_color();
 
         let (gradient, gradient_transform) =
@@ -833,47 +829,75 @@ fn raster_axis_tiling(
     }
 }
 
-/// One axis of the geometry a gradient layer is tiled over, in device pixels.
-struct GradientAxis {
-    /// The background positioning area: the phase anchor for the tile lattice.
-    origin_start: f64,
-    origin_len: f64,
-    /// The background painting area.
-    clip_start: f64,
-    clip_len: f64,
-    /// The part of that area that can land on the render surface. Tiles outside it
-    /// would be discarded by the backend, so they are never emitted.
-    visible_start: f64,
-    visible_len: f64,
-    bg_pos: f64,
-    tile_len: f64,
+/// Narrow one axis of a tiling to the tiles that can reach the render surface.
+///
+/// `tile_lo`/`tile_hi` are the axis extent of one tile *after* the fill transform, and
+/// `surface_lo`/`surface_hi` the surface in that same space, so tile `i` is visible iff
+/// `tile_lo + translate + i * stride < surface_hi` and
+/// `tile_hi + translate + i * stride > surface_lo`. Solving for `i` and keeping one extra
+/// tile at each end makes this conservative by construction: it can only ever drop a tile
+/// whose own bounding box misses the surface entirely, so it cannot change a rendered pixel.
+///
+/// Anything non-finite disables culling rather than risking a saturating cast to zero.
+fn cull_axis_to_surface(
+    tiling: &mut AxisTiling,
+    tile_lo: f64,
+    tile_hi: f64,
+    surface_lo: f64,
+    surface_hi: f64,
+) {
+    if tiling.count <= 1 || tiling.stride <= 0.0 {
+        return;
+    }
+    let bounds = [
+        tile_lo,
+        tile_hi,
+        surface_lo,
+        surface_hi,
+        tiling.translate,
+        tiling.stride,
+    ];
+    if bounds.iter().any(|value| !value.is_finite()) {
+        return;
+    }
+
+    let first = ((surface_lo - tile_hi - tiling.translate) / tiling.stride).floor() - 1.0;
+    let last = ((surface_hi - tile_lo - tiling.translate) / tiling.stride).ceil() + 1.0;
+    let max_index = f64::from(tiling.count - 1);
+    if last < 0.0 || first > max_index {
+        tiling.count = 0;
+        return;
+    }
+
+    let first = first.clamp(0.0, max_index);
+    let last = last.clamp(first, max_index);
+    tiling.translate += first * tiling.stride;
+    tiling.count = (last - first) as u32 + 1;
 }
 
 /// Per-axis placement and tiling for a gradient layer. Unlike raster images,
 /// gradients cannot rely on brush repetition, so `Repeat`/`Round` also produce
 /// explicit tiles. When the clip box extends beyond the origin box, tiling
 /// starts from the clip box edge so the pattern covers the whole clipped area.
-fn gradient_axis_tiling(repeat: BackgroundRepeatKeyword, axis: GradientAxis) -> AxisTiling {
+#[allow(clippy::too_many_arguments)]
+fn gradient_axis_tiling(
+    repeat: BackgroundRepeatKeyword,
+    origin_start: f64,
+    origin_len: f64,
+    clip_start: f64,
+    clip_len: f64,
+    bg_pos: f64,
+    tile_len: f64,
+) -> AxisTiling {
     use BackgroundRepeatKeyword::*;
-
-    let GradientAxis {
-        origin_start,
-        origin_len,
-        clip_start,
-        clip_len,
-        visible_start,
-        visible_len,
-        bg_pos,
-        tile_len,
-    } = axis;
 
     // A repeated tile narrower than one device pixel resolves none of its own detail, so
     // tiling it at its exact size only multiplies the fill count without changing a pixel:
     // `background-size: 0.2px` over a 100px axis asks for 500 fills, and a near-zero size
     // asks for an unbounded number. Widening such a tile to a single device pixel is
-    // visually equivalent, and together with the culling below it bounds the tile count at
-    // one fill per device pixel of the render surface. `NoRepeat` is a single fill whatever
-    // its size, so it keeps its exact geometry.
+    // visually equivalent, and together with `cull_axis_to_surface` it bounds the tile
+    // count at one fill per device pixel of the render surface. `NoRepeat` is a single fill
+    // whatever its size, so it keeps its exact geometry.
     let repeated_tile_len = tile_len.max(1.0);
 
     match repeat {
@@ -888,26 +912,6 @@ fn gradient_axis_tiling(repeat: BackgroundRepeatKeyword, axis: GradientAxis) -> 
             } else {
                 (origin_start, origin_len)
             };
-
-            // Cull to the render surface. The tile lattice is anchored on
-            // `origin_start + bg_pos` -- `extend()` below returns the distance back to the
-            // lattice line at or before `area_start`, for any `area_start` -- so narrowing
-            // the area moves the first tile along the same lattice and never shifts the
-            // pattern. Without this the count scales with the element's own extent, and a
-            // tall page costs time proportional to its height rather than to the pixels
-            // actually being produced.
-            let area_end = (area_start + area_len).min(visible_start + visible_len);
-            let area_start = area_start.max(visible_start);
-            let area_len = area_end - area_start;
-            if area_len <= 0.0 {
-                return AxisTiling {
-                    translate: area_start,
-                    rect_len: tile_len,
-                    count: 0,
-                    stride: tile_len,
-                };
-            }
-
             let extend_len = extend((origin_start - area_start) + bg_pos, tile_len);
             let count = ((area_len + extend_len) / tile_len).ceil() as u32;
             AxisTiling {
