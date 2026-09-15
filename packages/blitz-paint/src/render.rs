@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::kurbo_css::CssBox;
 use crate::color::{Color, ToColorColor};
+use crate::color_matrix::ColorMatrixChain;
 use crate::debug_overlay::render_debug_overlay;
 use crate::filters::convert_filters;
 use crate::kurbo_css::NonUniformRoundedRectRadii;
@@ -460,7 +461,20 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // Save it so that the mask can be drawn untransformed by scroll offsets.
                 let unscrolled_transform = cx.transform;
 
-                let filter = convert_filters(&effects.filter.0).map(Arc::new);
+                // Filter Effects 1 §13.1 expands seven of the ten shorthand
+                // filter functions to an alpha-preserving colour matrix. Those
+                // are applied by rewriting the colours of the recorded subtree
+                // (see `crate::color_matrix`), which is exactly equivalent to
+                // the §5 offscreen model for that subset and needs no render
+                // target. Anything else — `blur()`, `drop-shadow()`,
+                // `opacity()`, `url()` — stays on the `Filter` graph.
+                let color_matrix = ColorMatrixChain::from_filters(&effects.filter.0);
+                let filter = if color_matrix.is_some() {
+                    None
+                } else {
+                    convert_filters(&effects.filter.0).map(Arc::new)
+                };
+                let color_matrix = color_matrix.filter(|chain| !chain.is_identity());
                 let backdrop_filter = convert_filters(&effects.backdrop_filter.0).map(Arc::new);
 
                 // Adjust effect layer clip by filter expansion area
@@ -492,62 +506,33 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     &effect_layer_clip,
                     filter,
                     backdrop_filter,
-                    |scene| {
-                        cx.draw_background(scene);
-                        cx.draw_inset_box_shadow(scene);
-                        cx.draw_table_row_backgrounds(scene);
-                        cx.draw_table_borders(scene);
-                        cx.draw_border(scene);
-                        cx.stroke_devtools(scene);
-
-                        // TODO: allow layers with opacity to be unclipped (overflow: visible)
-                        let clip = if is_text_input {
-                            &cx.frame.content_box_path()
-                        } else {
-                            &cx.frame.padding_box_path()
-                        };
-
-                        // Clip layer if box requires clipping. Opacity set to 1.0
-                        self.layer_manager.maybe_with_layer(
+                    |scene| match &color_matrix {
+                        // Filter Effects 1 §5: the element and its descendants
+                        // "are rendered together as a group with the filter
+                        // effect applied to the group as a whole". The recording
+                        // is that group's buffer; the chain filters it before it
+                        // is composited into the parent scene.
+                        Some(chain) => {
+                            let mut group = Scene::default();
+                            cx.paint_effect_layer_contents(
+                                &mut group,
+                                should_clip,
+                                is_text_input,
+                                content_position,
+                                child_clip_rect,
+                                unscrolled_transform,
+                            );
+                            chain.apply_to_scene(&mut group);
+                            scene.append_scene(group, Affine::IDENTITY);
+                        }
+                        None => cx.paint_effect_layer_contents(
                             scene,
                             should_clip,
-                            1.0, // opacity
-                            cx.transform,
-                            clip,
-                            None,
-                            None,
-                            |scene| {
-                                // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
-                                let content_position = Point {
-                                    x: content_position.x - node.scroll_offset().x,
-                                    y: content_position.y - node.scroll_offset().y,
-                                };
-
-                                cx.transform = cx.transform.then_translate(Vec2 {
-                                    x: -node.scroll_offset().x * self.scale,
-                                    y: -node.scroll_offset().y * self.scale,
-                                });
-                                cx.draw_image(scene);
-                                #[cfg(feature = "svg")]
-                                cx.draw_svg(scene);
-                                #[cfg(feature = "custom-widget")]
-                                cx.draw_custom_widget(scene);
-                                cx.draw_sub_document(scene);
-                                cx.draw_input(scene);
-                                cx.draw_text_input_text(scene, content_position);
-                                cx.draw_inline_layout(scene, content_position);
-                                cx.draw_marker(scene, content_position);
-                                cx.draw_children(scene, cx.transform, child_clip_rect);
-                            },
-                        );
-
-                        // Overlay scrollbars, drawn unscrolled above the
-                        // clipped content.
-                        #[cfg(feature = "scrollbars")]
-                        {
-                            cx.transform = unscrolled_transform;
-                            cx.draw_scrollbars(scene);
-                        }
+                            is_text_input,
+                            content_position,
+                            child_clip_rect,
+                            unscrolled_transform,
+                        ),
                     },
                 );
 
@@ -959,6 +944,83 @@ impl ElementCx<'_, '_> {
                 self.node.id,
                 &mut draw_text_context,
             );
+        }
+    }
+
+    /// Paint everything that belongs inside the element's opacity/filter layer:
+    /// its own box decorations, then its clipped content and children.
+    ///
+    /// Split out of `render_element` so that the same drawing can be directed
+    /// either straight at the target scene or into a recorded sub-scene that a
+    /// [`ColorMatrixChain`] then filters. `Scene` is a concrete type, so the
+    /// recursion through `draw_children` monomorphises to a fixed point instead
+    /// of nesting a new scene type per filtered ancestor.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_effect_layer_contents(
+        &mut self,
+        scene: &mut impl PaintScene,
+        should_clip: bool,
+        is_text_input: bool,
+        content_position: Point,
+        child_clip_rect: Rect,
+        #[cfg_attr(not(feature = "scrollbars"), expect(unused_variables))]
+        unscrolled_transform: Affine,
+    ) {
+        self.draw_background(scene);
+        self.draw_inset_box_shadow(scene);
+        self.draw_table_row_backgrounds(scene);
+        self.draw_table_borders(scene);
+        self.draw_border(scene);
+        self.stroke_devtools(scene);
+
+        // TODO: allow layers with opacity to be unclipped (overflow: visible)
+        let clip = if is_text_input {
+            self.frame.content_box_path()
+        } else {
+            self.frame.padding_box_path()
+        };
+
+        let layer_manager = &self.context.layer_manager;
+        let layer_used = layer_manager.maybe_push_layer(
+            scene,
+            should_clip,
+            1.0, // opacity
+            self.transform,
+            &clip,
+            None,
+            None,
+        );
+
+        // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
+        let scroll_offset = self.node.scroll_offset();
+        let content_position = Point {
+            x: content_position.x - scroll_offset.x,
+            y: content_position.y - scroll_offset.y,
+        };
+
+        self.transform = self.transform.then_translate(Vec2 {
+            x: -scroll_offset.x * self.scale,
+            y: -scroll_offset.y * self.scale,
+        });
+        self.draw_image(scene);
+        #[cfg(feature = "svg")]
+        self.draw_svg(scene);
+        #[cfg(feature = "custom-widget")]
+        self.draw_custom_widget(scene);
+        self.draw_sub_document(scene);
+        self.draw_input(scene);
+        self.draw_text_input_text(scene, content_position);
+        self.draw_inline_layout(scene, content_position);
+        self.draw_marker(scene, content_position);
+        self.draw_children(scene, self.transform, child_clip_rect);
+
+        layer_manager.maybe_pop_layer(scene, layer_used);
+
+        // Overlay scrollbars, drawn unscrolled above the clipped content.
+        #[cfg(feature = "scrollbars")]
+        {
+            self.transform = unscrolled_transform;
+            self.draw_scrollbars(scene);
         }
     }
 

@@ -4,6 +4,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod color;
+mod color_matrix;
 mod debug_overlay;
 mod filters;
 mod gradient;
