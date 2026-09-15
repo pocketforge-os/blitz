@@ -324,6 +324,20 @@ struct InlineContextStrut {
     bounds: Option<(f32, f32)>,
 }
 
+/// The strut state threaded through the construction of one inline formatting context.
+///
+/// The block's own strut bounds every line box in the context; each descendant that computes
+/// `line-height: normal` additionally contributes its own first available font, so both travel
+/// together down the same recursion.
+#[derive(Clone, Copy)]
+struct InlineStruts<'a> {
+    /// The strut of the block establishing this inline formatting context.
+    root: InlineContextStrut,
+    /// First available font ascent/descent of each descendant computing `line-height: normal`,
+    /// keyed by node. Absent for nodes whose `line-height` is a length or a number.
+    by_node: &'a HashMap<NodeId, (f32, f32)>,
+}
+
 /// Result of classifying the in-flow children of a flow container as
 /// all-block, all-inline and/or all-out-of-flow.
 struct FlowClassification {
@@ -1100,6 +1114,10 @@ pub(crate) fn build_inline_layout_into(
             Some((ascent + above, descent + (leading - above)))
         }),
     };
+    let struts = InlineStruts {
+        root: root_strut,
+        by_node: &normal_struts,
+    };
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
@@ -1149,8 +1167,7 @@ pub(crate) fn build_inline_layout_into(
             before_id,
             collapse_mode,
             text_transform,
-            root_strut,
-            &normal_struts,
+            struts,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1161,8 +1178,7 @@ pub(crate) fn build_inline_layout_into(
             child_id,
             collapse_mode,
             text_transform,
-            root_strut,
-            &normal_struts,
+            struts,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1173,8 +1189,7 @@ pub(crate) fn build_inline_layout_into(
             after_id,
             collapse_mode,
             text_transform,
-            root_strut,
-            &normal_struts,
+            struts,
         );
     }
 
@@ -1188,8 +1203,7 @@ pub(crate) fn build_inline_layout_into(
         node_id: NodeId,
         collapse_mode: WhiteSpaceCollapse,
         parent_text_transform: TextTransform,
-        root_strut: InlineContextStrut,
-        normal_struts: &HashMap<NodeId, (f32, f32)>,
+        struts: InlineStruts<'_>,
     ) {
         let node = &nodes[node_id];
 
@@ -1246,8 +1260,7 @@ pub(crate) fn build_inline_layout_into(
                                 child_id,
                                 collapse_mode,
                                 text_transform,
-                                root_strut,
-                                normal_struts,
+                                struts,
                             );
                         }
                     }
@@ -1284,7 +1297,7 @@ pub(crate) fn build_inline_layout_into(
                                     stylo_to_parley::style(
                                         node.id,
                                         &s,
-                                        normal_struts.get(&node.id).copied(),
+                                        struts.by_node.get(&node.id).copied(),
                                     )
                                 })
                                 .unwrap_or_default();
@@ -1306,7 +1319,7 @@ pub(crate) fn build_inline_layout_into(
                             // The strut pair sums to the block's line height, so a span drawing only
                             // from its own first available font lands on exactly the height the
                             // scalar floor produced.
-                            style.line_height = match (style.line_height, root_strut.bounds) {
+                            style.line_height = match (style.line_height, struts.root.bounds) {
                                 (
                                     parley::LineHeight::Normal {
                                         strut_ascent,
@@ -1322,7 +1335,7 @@ pub(crate) fn build_inline_layout_into(
                                 }
                                 (line_height, _) => parley::LineHeight::Absolute(
                                     resolve_line_height(line_height, font_size)
-                                        .max(root_strut.line_height),
+                                        .max(struts.root.line_height),
                                 ),
                             };
 
@@ -1339,8 +1352,7 @@ pub(crate) fn build_inline_layout_into(
                                     before_id,
                                     collapse_mode,
                                     text_transform,
-                                    root_strut,
-                                    normal_struts,
+                                    struts,
                                 );
                             }
 
@@ -1352,8 +1364,7 @@ pub(crate) fn build_inline_layout_into(
                                     child_id,
                                     collapse_mode,
                                     text_transform,
-                                    root_strut,
-                                    normal_struts,
+                                    struts,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1364,8 +1375,7 @@ pub(crate) fn build_inline_layout_into(
                                     after_id,
                                     collapse_mode,
                                     text_transform,
-                                    root_strut,
-                                    normal_struts,
+                                    struts,
                                 );
                             }
 
