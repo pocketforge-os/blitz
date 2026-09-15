@@ -290,6 +290,27 @@ impl ElementCx<'_, '_> {
         (viewport_rect, transform)
     }
 
+    /// The region of `transform`'s local space that can land on the render surface.
+    ///
+    /// Anything a fill places outside the surface is discarded by the backend, so this is
+    /// the largest area worth emitting tiles for. Returned as an axis-aligned bound, which
+    /// is exact for the translation/scale transforms backgrounds normally carry and
+    /// conservative (too large, never too small) under rotation or skew. A non-invertible
+    /// transform collapses the element to nothing, so nothing is culled and the caller's
+    /// own geometry decides.
+    fn paintable_area(&self, transform: Affine) -> Rect {
+        let surface = Rect::new(
+            0.0,
+            0.0,
+            self.context.width as f64,
+            self.context.height as f64,
+        );
+        if transform.determinant() == 0.0 {
+            return surface;
+        }
+        transform.inverse().transform_rect_bbox(surface)
+    }
+
     /// Whether this element or any of its ancestors has a CSS transform
     ///
     /// TODO: this misses transformed elements whose resolved transform is the
@@ -491,31 +512,45 @@ impl ElementCx<'_, '_> {
         let bg_pos = (bg_pos.to_vec2() * self.scale).to_point();
         let bg_size = bg_size * self.scale;
 
+        // css-backgrounds-3 s3.9: if either dimension of the computed `background-size` is
+        // zero, the image is not rendered. Returning here also keeps the tiling arithmetic
+        // below away from a division by zero.
+        if bg_size.width <= 0.0 || bg_size.height <= 0.0 {
+            return;
+        }
+
         let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
+
+        // The part of the layer that can reach the render surface, in the same local
+        // coordinates the tiling is computed in.
+        let visible_rect = self.paintable_area(base_transform);
 
         let x = gradient_axis_tiling(
             *repeat_x,
-            origin_rect.x0,
-            origin_rect.width(),
-            clip_rect.x0,
-            clip_rect.width(),
-            bg_pos.x,
-            bg_size.width,
+            GradientAxis {
+                origin_start: origin_rect.x0,
+                origin_len: origin_rect.width(),
+                clip_start: clip_rect.x0,
+                clip_len: clip_rect.width(),
+                visible_start: visible_rect.x0,
+                visible_len: visible_rect.width(),
+                bg_pos: bg_pos.x,
+                tile_len: bg_size.width,
+            },
         );
         let y = gradient_axis_tiling(
             *repeat_y,
-            origin_rect.y0,
-            origin_rect.height(),
-            clip_rect.y0,
-            clip_rect.height(),
-            bg_pos.y,
-            bg_size.height,
+            GradientAxis {
+                origin_start: origin_rect.y0,
+                origin_len: origin_rect.height(),
+                clip_start: clip_rect.y0,
+                clip_len: clip_rect.height(),
+                visible_start: visible_rect.y0,
+                visible_len: visible_rect.height(),
+                bg_pos: bg_pos.y,
+                tile_len: bg_size.height,
+            },
         );
-
-        // FIXME: https://wpt.live/css/css-backgrounds/background-size/background-size-near-zero-gradient.html
-        if x.count as u64 * y.count as u64 > 500 {
-            return;
-        }
 
         let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
         let current_color = self.style.clone_color();
@@ -798,23 +833,52 @@ fn raster_axis_tiling(
     }
 }
 
+/// One axis of the geometry a gradient layer is tiled over, in device pixels.
+struct GradientAxis {
+    /// The background positioning area: the phase anchor for the tile lattice.
+    origin_start: f64,
+    origin_len: f64,
+    /// The background painting area.
+    clip_start: f64,
+    clip_len: f64,
+    /// The part of that area that can land on the render surface. Tiles outside it
+    /// would be discarded by the backend, so they are never emitted.
+    visible_start: f64,
+    visible_len: f64,
+    bg_pos: f64,
+    tile_len: f64,
+}
+
 /// Per-axis placement and tiling for a gradient layer. Unlike raster images,
 /// gradients cannot rely on brush repetition, so `Repeat`/`Round` also produce
 /// explicit tiles. When the clip box extends beyond the origin box, tiling
 /// starts from the clip box edge so the pattern covers the whole clipped area.
-fn gradient_axis_tiling(
-    repeat: BackgroundRepeatKeyword,
-    origin_start: f64,
-    origin_len: f64,
-    clip_start: f64,
-    clip_len: f64,
-    bg_pos: f64,
-    tile_len: f64,
-) -> AxisTiling {
+fn gradient_axis_tiling(repeat: BackgroundRepeatKeyword, axis: GradientAxis) -> AxisTiling {
     use BackgroundRepeatKeyword::*;
+
+    let GradientAxis {
+        origin_start,
+        origin_len,
+        clip_start,
+        clip_len,
+        visible_start,
+        visible_len,
+        bg_pos,
+        tile_len,
+    } = axis;
+
+    // A repeated tile narrower than one device pixel resolves none of its own detail, so
+    // tiling it at its exact size only multiplies the fill count without changing a pixel:
+    // `background-size: 0.2px` over a 100px axis asks for 500 fills, and a near-zero size
+    // asks for an unbounded number. Widening such a tile to a single device pixel is
+    // visually equivalent, and together with the culling below it bounds the tile count at
+    // one fill per device pixel of the render surface. `NoRepeat` is a single fill whatever
+    // its size, so it keeps its exact geometry.
+    let repeated_tile_len = tile_len.max(1.0);
 
     match repeat {
         Repeat | Round => {
+            let tile_len = repeated_tile_len;
             // The clip and origin boxes are nested, so the clip box extends
             // beyond the origin box iff it does so at either end
             let clip_is_outer =
@@ -824,6 +888,26 @@ fn gradient_axis_tiling(
             } else {
                 (origin_start, origin_len)
             };
+
+            // Cull to the render surface. The tile lattice is anchored on
+            // `origin_start + bg_pos` -- `extend()` below returns the distance back to the
+            // lattice line at or before `area_start`, for any `area_start` -- so narrowing
+            // the area moves the first tile along the same lattice and never shifts the
+            // pattern. Without this the count scales with the element's own extent, and a
+            // tall page costs time proportional to its height rather than to the pixels
+            // actually being produced.
+            let area_end = (area_start + area_len).min(visible_start + visible_len);
+            let area_start = area_start.max(visible_start);
+            let area_len = area_end - area_start;
+            if area_len <= 0.0 {
+                return AxisTiling {
+                    translate: area_start,
+                    rect_len: tile_len,
+                    count: 0,
+                    stride: tile_len,
+                };
+            }
+
             let extend_len = extend((origin_start - area_start) + bg_pos, tile_len);
             let count = ((area_len + extend_len) / tile_len).ceil() as u32;
             AxisTiling {
@@ -834,6 +918,7 @@ fn gradient_axis_tiling(
             }
         }
         Space => {
+            let tile_len = repeated_tile_len;
             let (count, stride) = compute_space_count_and_stride(origin_len, tile_len);
             AxisTiling {
                 translate: origin_start + if count == 1 { bg_pos } else { 0.0 },
