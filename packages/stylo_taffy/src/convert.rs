@@ -180,6 +180,52 @@ pub fn inset(val: &stylo::InsetVal) -> taffy::LengthPercentageAuto {
     }
 }
 
+/// The inset a box contributes to *layout*, which is not the same thing as its
+/// computed inset when the box is `position: sticky`.
+///
+/// For `relative` and `absolute`/`fixed` boxes the computed inset is the layout
+/// inset, so this is just [`inset`].
+///
+/// A sticky box is different. CSS Positioned Layout 3 § 3.4 defines sticky
+/// positioning as "similar to relative positioning except the offsets are
+/// automatically calculated in reference to the nearest scrollport": its inset
+/// properties do not translate the box, they "represent insets from the
+/// respective edges of the scrollport [...] defining the sticky view rectangle
+/// used to constrain the box's position". The box itself is only "visually
+/// shifted (as for relative positioning)" for a given side when "the
+/// corresponding border edge of the box would be outside the corresponding edge
+/// of the sticky view rectangle" — a clamp, applied after layout against a live
+/// scroll position, not a translation applied during it. The spec spells the
+/// consequence out normatively:
+///
+/// > Note: A sticky positioned element with a non-`auto` `top` value and an
+/// > `auto` `bottom` value will only ever be pushed *down* by sticky
+/// > positioning; it will never be offset upwards.
+///
+/// Feeding the computed inset to Taffy as a relative offset breaks exactly
+/// that: `position: sticky; top: -8px` moved the box 8px *up* even though its
+/// scrollport never constrained it, which no sticky box may ever do.
+///
+/// Blitz does not implement the scroll-dependent shift yet (scrolling does not
+/// re-run layout — the painter translates by the scroll offset — so it cannot
+/// be expressed as a layout inset at all). Until it does, a sticky box is laid
+/// out where it would sit unconstrained, which is where a browser paints it
+/// whenever its scrollport is not pushing it: the unshifted, in-flow position.
+///
+/// <https://drafts.csswg.org/css-position-3/#sticky-pos>
+#[inline]
+pub fn layout_inset(
+    position: stylo::Position,
+    val: &stylo::InsetVal,
+) -> taffy::LengthPercentageAuto {
+    match position {
+        // An `auto` inset in both axes is "no offsets are added in that axis",
+        // i.e. the box stays where it was laid out.
+        stylo::Position::Sticky => taffy::LengthPercentageAuto::AUTO,
+        _ => self::inset(val),
+    }
+}
+
 #[inline]
 pub fn is_block(input: stylo::Display) -> bool {
     self::display(input) == taffy::Display::Block
@@ -253,9 +299,14 @@ pub fn position(input: stylo::Position) -> taffy::Position {
         stylo::Position::Relative => taffy::Position::Relative,
         stylo::Position::Static => taffy::Position::Relative,
 
-        // TODO: support position:fixed and sticky
+        // TODO: support position:fixed
         stylo::Position::Absolute => taffy::Position::Absolute,
         stylo::Position::Fixed => taffy::Position::Absolute,
+
+        // A sticky box is in flow and is laid out exactly as a relative box
+        // (CSS Positioned Layout 3 § 3.4). Its insets are *not* relative
+        // offsets though, so they are dropped in `layout_inset`; the
+        // scroll-dependent shift is still TODO.
         stylo::Position::Sticky => taffy::Position::Relative,
     }
 }
@@ -711,6 +762,7 @@ pub fn max_track(
 /// Eagerly convert an entire [`stylo::ComputedValues`] into a [`taffy::Style`]
 pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
     let display = style.clone_display();
+    let position = style.clone_position();
     let pos = style.get_position();
     let margin = style.get_margin();
     let padding = style.get_padding();
@@ -722,7 +774,7 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         box_sizing: self::box_sizing(style.clone_box_sizing()),
         item_is_table: display.inside() == stylo::DisplayInside::Table,
         item_is_replaced: false,
-        position: self::position(style.clone_position()),
+        position: self::position(position),
         overflow: taffy::Point {
             x: self::overflow(style.clone_overflow_x()),
             y: self::overflow(style.clone_overflow_y()),
@@ -751,10 +803,10 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         aspect_ratio: self::aspect_ratio(pos.aspect_ratio),
 
         inset: taffy::Rect {
-            left: self::inset(&pos.left),
-            right: self::inset(&pos.right),
-            top: self::inset(&pos.top),
-            bottom: self::inset(&pos.bottom),
+            left: self::layout_inset(position, &pos.left),
+            right: self::layout_inset(position, &pos.right),
+            top: self::layout_inset(position, &pos.top),
+            bottom: self::layout_inset(position, &pos.bottom),
         },
         margin: taffy::Rect {
             left: self::margin(&margin.margin_left),

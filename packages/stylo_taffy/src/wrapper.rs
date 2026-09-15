@@ -114,12 +114,16 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
 
     #[inline]
     fn inset(&self) -> taffy::Rect<taffy::LengthPercentageAuto> {
+        // `layout_inset`, not `inset`: a sticky box's computed insets bound a
+        // sticky view rectangle, they are not a relative offset to lay it out
+        // by. See `convert::layout_inset`.
+        let position = self.style.get_box().position;
         let position_styles = self.style.get_position();
         taffy::Rect {
-            left: convert::inset(&position_styles.left),
-            right: convert::inset(&position_styles.right),
-            top: convert::inset(&position_styles.top),
-            bottom: convert::inset(&position_styles.bottom),
+            left: convert::layout_inset(position, &position_styles.left),
+            right: convert::layout_inset(position, &position_styles.right),
+            top: convert::layout_inset(position, &position_styles.top),
+            bottom: convert::layout_inset(position, &position_styles.bottom),
         }
     }
 
