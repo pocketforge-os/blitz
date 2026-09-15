@@ -506,20 +506,26 @@ impl ElementCx<'_, '_> {
             y_ratio,
         );
 
-        let transform = base_transform
-            .pre_scale_non_uniform(x_ratio, y_ratio)
-            .then_translate(Vec2 {
-                x: x.translate,
-                y: y.translate,
-            });
+        // `translate` and `stride` are lengths in the element's own coordinate space, so they
+        // are applied *before* `base_transform` and before the image scale: the fill rect is
+        // in image pixels, `image_transform` takes it to element-local pixels, and only then
+        // is the tile positioned. Adding the placement to the transform's output instead
+        // (`then_translate`) steps the layer along the surface axes, which is a different
+        // point as soon as the element carries a transform whose linear part is not the
+        // identity -- and steps a `Space` lattice at the unscaled stride.
+        let placed = base_transform.pre_translate(Vec2 {
+            x: x.translate,
+            y: y.translate,
+        });
+        let image_transform = Affine::scale_non_uniform(x_ratio, y_ratio);
         let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
 
         for hc in 0..y.count {
             for wc in 0..x.count {
-                let transform = transform.then_translate(Vec2 {
+                let transform = placed.pre_translate(Vec2 {
                     x: wc as f64 * x.stride,
                     y: hc as f64 * y.stride,
-                });
+                }) * image_transform;
 
                 scene.fill(
                     peniko::Fill::NonZero,
@@ -595,18 +601,18 @@ impl ElementCx<'_, '_> {
         // scales with the element's own extent, so a tall page costs time proportional to its
         // height rather than to the pixels actually being produced.
         //
-        // Tile `i` is drawn as `base_transform.then_translate(translate + i * stride)` over
-        // `tile_rect`, and `then_translate` adds to the transform's *output* translation, so
-        // the lattice steps along the surface axes while `tile_rect` itself carries the
-        // transform's linear part. Both facts are used here: the tile's surface-space extent
-        // is the bounding box of `base_transform * tile_rect`, and the per-tile offset is
-        // added to it directly. Deriving the bound in the layer's own space instead -- by
-        // inverting the transform -- describes a different set of tiles the moment that
-        // linear part is not the identity, and drops tiles the lattice still needs.
-        let tile_bbox = base_transform.transform_rect_bbox(tile_rect);
-        let surface = self.surface_rect();
-        cull_axis_to_surface(&mut x, tile_bbox.x0, tile_bbox.x1, surface.x0, surface.x1);
-        cull_axis_to_surface(&mut y, tile_bbox.y0, tile_bbox.y1, surface.y0, surface.y1);
+        // The per-tile offset below is applied *before* `base_transform` (`pre_translate`), so
+        // the lattice scales, rotates and skews with the element the way CSS requires. The
+        // bound has to be expressed in that same space: the bounding box of the surface pulled
+        // back through `base_transform` contains every layer-space point that can map onto the
+        // surface, so culling against it can only ever drop a tile that is genuinely
+        // off-surface. A singular `base_transform` makes that pullback non-finite, which
+        // `cull_axis_to_surface` reads as "do not cull".
+        let surface = base_transform
+            .inverse()
+            .transform_rect_bbox(self.surface_rect());
+        cull_axis_to_surface(&mut x, tile_rect.x0, tile_rect.x1, surface.x0, surface.x1);
+        cull_axis_to_surface(&mut y, tile_rect.y0, tile_rect.y1, surface.y0, surface.y1);
 
         let current_color = self.style.clone_color();
 
@@ -614,14 +620,21 @@ impl ElementCx<'_, '_> {
             to_peniko_gradient(gradient, tile_rect, self.scale, &current_color);
         let brush = anyrender::Paint::Gradient(&gradient);
 
-        let transform = base_transform.then_translate(Vec2 {
+        // The layer's placement and its tile lattice are both expressed in the element's own
+        // coordinate space (`origin_rect` is the element-local box and `stride` a length in
+        // it), so both are applied *before* `base_transform`. Adding them to the transform's
+        // output instead -- `then_translate` -- steps the lattice along the surface axes while
+        // each tile still carries the transform's linear part, so under `scale(s)` the pattern
+        // advances `tile_len` surface pixels per tile while each tile is `s * tile_len` wide
+        // and the background covers only the element's unscaled extent.
+        let placed = base_transform.pre_translate(Vec2 {
             x: x.translate,
             y: y.translate,
         });
 
         for hc in 0..y.count {
             for wc in 0..x.count {
-                let transform = transform.then_translate(Vec2 {
+                let transform = placed.pre_translate(Vec2 {
                     x: wc as f64 * x.stride,
                     y: hc as f64 * y.stride,
                 });
@@ -890,8 +903,8 @@ fn raster_axis_tiling(
 
 /// Narrow one axis of a tiling to the tiles that can reach the render surface.
 ///
-/// `tile_lo`/`tile_hi` are the axis extent of one tile *after* the fill transform, and
-/// `surface_lo`/`surface_hi` the surface in that same space, so tile `i` is visible iff
+/// `tile_lo`/`tile_hi` are the axis extent of one tile and `surface_lo`/`surface_hi` the
+/// surface, both in the space the per-tile offset is applied in, so tile `i` is visible iff
 /// `tile_lo + translate + i * stride < surface_hi` and
 /// `tile_hi + translate + i * stride > surface_lo`. Solving for `i` and keeping one extra
 /// tile at each end makes this conservative by construction: it can only ever drop a tile
