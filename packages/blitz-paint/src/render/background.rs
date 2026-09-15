@@ -321,8 +321,6 @@ impl ElementCx<'_, '_> {
 
     #[cfg(feature = "svg")]
     fn draw_svg_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
-        use kurbo::Affine;
-
         let Some(bg_image) = layer.image_data else {
             return;
         };
@@ -335,14 +333,19 @@ impl ElementCx<'_, '_> {
             return;
         }
 
-        let (origin_rect, base_transform) = if self.layer_is_fixed(layer) {
-            self.fixed_positioning_area()
+        // For a fixed layer the positioning area (the viewport) already covers
+        // everything visible, so it also serves as the clip rect (no extension
+        // towards the clip box is needed).
+        let (origin_rect, base_transform, clip_rect) = if self.layer_is_fixed(layer) {
+            let (viewport_rect, transform) = self.fixed_positioning_area();
+            (viewport_rect, transform, viewport_rect)
         } else {
-            (self.box_rect(layer.origin), self.transform)
+            (
+                self.box_rect(layer.origin),
+                self.transform,
+                self.box_rect(layer.clip),
+            )
         };
-
-        let frame_w = (origin_rect.width() / self.scale) as f32;
-        let frame_h = (origin_rect.height() / self.scale) as f32;
 
         let svg_size = svg.tree.size();
 
@@ -359,10 +362,10 @@ impl ElementCx<'_, '_> {
         }
         .filter(|r| r.is_finite() && *r > 0.0);
 
-        let bg_size = compute_layer_size(
+        let (bg_pos, bg_size) = compute_layer_position_and_size(
             layer,
-            frame_w,
-            frame_h,
+            origin_rect.width() / self.scale,
+            origin_rect.height() / self.scale,
             BackgroundSizeComputeMode::Intrinsic {
                 width: intrinsic_width,
                 height: intrinsic_height,
@@ -370,27 +373,83 @@ impl ElementCx<'_, '_> {
             },
         );
 
+        let bg_pos = (bg_pos.to_vec2() * self.scale).to_point();
+        let bg_size = bg_size * self.scale;
+
+        // css-backgrounds-3 s3.9: if either dimension of the computed `background-size` is
+        // zero, the image is not rendered. Returning here also keeps the tiling arithmetic
+        // below away from a division by zero.
         if bg_size.width <= 0.0 || bg_size.height <= 0.0 {
             return;
         }
 
-        let x_ratio = (bg_size.width / svg_size.width() as f64) * self.scale;
-        let y_ratio = (bg_size.height / svg_size.height() as f64) * self.scale;
+        let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
 
-        let bg_pos = compute_layer_position(
-            layer,
-            frame_w - bg_size.width as f32,
-            frame_h - bg_size.height as f32,
+        // An SVG layer is drawn by replaying its tree into the scene, so -- exactly like a
+        // gradient, and unlike a raster image -- it has no brush whose own `Extend::Repeat`
+        // could tile it in a single fill. `Repeat`/`Round` therefore need explicit tiles,
+        // which is what `gradient_axis_tiling` produces; reusing it also gives this layer
+        // kind the same near-zero `background-size` handling (a tile thinner than a device
+        // pixel is widened to one, instead of asking for an unbounded number of replays).
+        let mut x = gradient_axis_tiling(
+            *repeat_x,
+            origin_rect.x0,
+            origin_rect.width(),
+            clip_rect.x0,
+            clip_rect.width(),
+            bg_pos.x,
+            bg_size.width,
+        );
+        let mut y = gradient_axis_tiling(
+            *repeat_y,
+            origin_rect.y0,
+            origin_rect.height(),
+            clip_rect.y0,
+            clip_rect.height(),
+            bg_pos.y,
+            bg_size.height,
         );
 
-        let transform = base_transform
-            * kurbo::Affine::translate((
-                origin_rect.x0 + bg_pos.x * self.scale,
-                origin_rect.y0 + bg_pos.y * self.scale,
-            ))
-            * Affine::scale_non_uniform(x_ratio, y_ratio);
+        // Scale the tree to the tile actually being drawn, not to `bg_size`: the two differ
+        // only where `gradient_axis_tiling` widened a sub-device-pixel tile, and there the
+        // image has to grow with it or the lattice would leave gaps between the replays.
+        let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
+        let svg_transform = Affine::scale_non_uniform(
+            tile_rect.width() / svg_size.width() as f64,
+            tile_rect.height() / svg_size.height() as f64,
+        );
 
-        anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+        // Drop the tiles that cannot land on the render surface, so the replay count follows
+        // the visible pixels rather than the element's own extent.
+        //
+        // The per-tile offset here is applied *before* `base_transform` (`pre_translate`), so
+        // that the lattice scales and rotates with the element the way CSS requires, rather
+        // than stepping along the surface axes. The bound has to be expressed in that same
+        // space: the bounding box of the surface pulled back through `base_transform` contains
+        // every layer-space point that can map onto the surface, so culling against it can
+        // only ever drop a tile that is genuinely off-surface. A singular `base_transform`
+        // makes that pullback non-finite, which `cull_axis_to_surface` reads as "do not cull".
+        let surface = base_transform
+            .inverse()
+            .transform_rect_bbox(self.surface_rect());
+        cull_axis_to_surface(&mut x, tile_rect.x0, tile_rect.x1, surface.x0, surface.x1);
+        cull_axis_to_surface(&mut y, tile_rect.y0, tile_rect.y1, surface.y0, surface.y1);
+
+        let placed = base_transform.pre_translate(Vec2 {
+            x: x.translate,
+            y: y.translate,
+        });
+
+        for hc in 0..y.count {
+            for wc in 0..x.count {
+                let transform = placed.pre_translate(Vec2 {
+                    x: wc as f64 * x.stride,
+                    y: hc as f64 * y.stride,
+                }) * svg_transform;
+
+                anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+            }
+        }
     }
 
     fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
