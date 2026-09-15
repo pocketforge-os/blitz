@@ -340,6 +340,15 @@ fn resolve_color_stops<T>(
 ) -> (f32, f32) {
     let mut hint: Option<f32> = None;
 
+    // CSS Images 3 s3.4.3 "Color Stop Fixup", step 2: a color stop or transition hint
+    // whose position is before that of any stop or hint ahead of it in the list is moved
+    // forward to the largest position specified so far. Stylo hands over the *specified*
+    // positions, so the idiomatic hard-edged form `<c1> 0 25%, <c2> 0 50%` arrives as the
+    // unsorted list 0, 0.25, 0, 0.5. Every downstream consumer -- the repeating-gradient
+    // renormalisation below, and the sampler in the backend -- assumes a non-decreasing
+    // offset list, and an unsorted one collapses the whole ramp to its first color.
+    let mut max_offset = f32::NEG_INFINITY;
+
     for (idx, item) in items.iter().enumerate() {
         let (color, offset) = match item {
             GenericGradientItem::SimpleColorStop(color) => {
@@ -361,10 +370,17 @@ fn resolve_color_stops<T>(
                 }
             }
             GenericGradientItem::InterpolationHint(position) => {
-                hint = item_resolver(gradient_length, position);
+                hint = item_resolver(gradient_length, position).map(|position| {
+                    let position = position.max(max_offset);
+                    max_offset = position;
+                    position
+                });
                 continue;
             }
         };
+
+        let offset = offset.max(max_offset);
+        max_offset = offset;
 
         if idx == 0 && !repeating && offset != 0.0 {
             gradient
