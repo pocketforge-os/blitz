@@ -1,7 +1,7 @@
 use super::{ElementCx, PhysicalTracks, to_image_quality, to_peniko_image};
 use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
-use anyrender::PaintScene;
+use anyrender::{PaintScene, Scene, recording::RenderCommand};
 use blitz_dom::node::{ImageData, ImageResourceData, SpecialElementData};
 use kurbo::{self, Affine, BezPath, Point, Rect, Size, Vec2};
 use peniko::{self, Fill};
@@ -440,6 +440,128 @@ impl ElementCx<'_, '_> {
             y: y.translate,
         });
 
+        // Fast path: rasterise the tile once and let a repeating image brush tile it in a
+        // single fill, the way `draw_raster_image_layer` does for a raster `background-image`.
+        //
+        // Replaying the tile's vector scene per tile costs time proportional to the painted
+        // area -- a full-screen 4x4 stipple at 1280x720 is 57,600 tiles and measured 50.9 ms
+        // per frame in release, against a 16.7 ms 60 fps budget; the same stipple through this
+        // path measured 2.0 ms. Measurement also rules out the cheaper fixes: the tree walk is
+        // only 28% of it, and collapsing all 115,200 draw calls into two by batching the
+        // geometry changed nothing, because the cost is the volume of vector geometry handed
+        // to the rasteriser. See `tests/blitz-tests/tests/svg_tiling_cost.rs`.
+        //
+        // The substitution must not move a pixel, so it is taken only where a repeating brush
+        // provably cannot differ from the lattice it replaces:
+        //
+        //  - **Whole device pixels.** A brush samples one rasterisation at every repeat, so it
+        //    matches a per-tile replay exactly when the sampling is an identity. A fractional
+        //    tile makes it interpolate a texture the replay would have drawn crisply: measured
+        //    0 differing pixels at 4x4 and 2x2, against 46.96% of the surface at 4.5px.
+        //  - **`Repeat`/`Round` on both axes.** These are the cases whose stride is the tile
+        //    size, so the brush's own period lines up with the lattice. `Space` distributes a
+        //    remainder between tiles and keeps the explicit loop.
+        //  - **More than one tile.** A single tile is already a single replay; substituting
+        //    there would trade an exact drawing for a resampled one and gain nothing.
+        //  - **A rasteriser that accepts it.** The embedder may decline any tile, and every
+        //    declined tile falls through to the code below unchanged.
+        //
+        // The fill reuses the lattice's own numbers rather than recomputing the area, so the
+        // painted extent is the one the replay would have covered, including the clip-box
+        // extension `gradient_axis_tiling` applies when the clip box is outside the origin box.
+        // The brush's phase is anchored at the fill rect's origin, which `placed` puts at the
+        // lattice's first tile -- and culling only advances that origin by whole strides, so
+        // the phase survives it.
+        #[cfg(feature = "svg")]
+        if let Some(rasterizer) = self.context.svg_tile_rasterizer {
+            let both_repeat = matches!(
+                (repeat_x, repeat_y),
+                (
+                    BackgroundRepeatKeyword::Repeat | BackgroundRepeatKeyword::Round,
+                    BackgroundRepeatKeyword::Repeat | BackgroundRepeatKeyword::Round
+                )
+            );
+            let tile_count = u64::from(x.count) * u64::from(y.count);
+            if both_repeat
+                && tile_count > 1
+                && crate::svg_tile::is_exact_tile_size(x.rect_len, y.rect_len)
+                && crate::svg_tile::is_pixel_aligned_placement(placed)
+            {
+                // Recorded at `svg_transform`, so the tree fills the tile box exactly. This
+                // is a different recording from the replay path's below, which is taken at
+                // `Affine::IDENTITY` to keep the per-tile transform product bit-identical;
+                // only one of the two is ever built, because this path returns.
+                let mut raster_scene = Scene::new();
+                anyrender_svg::render_svg_tree(&mut raster_scene, &svg.tree, svg_transform);
+                let request = crate::SvgTileRequest {
+                    tree: &svg.tree,
+                    scene: &raster_scene,
+                    width: x.rect_len as u32,
+                    height: y.rect_len as u32,
+                };
+                // The last condition can only be checked once the tile exists: a tile
+                // carrying partial alpha is quantised to 8 bits on the way into the buffer
+                // and again on the way out, where the replay composites once, so it is not
+                // exact even pixel-aligned and unscaled.
+                if let Some(image) = rasterizer.rasterize_svg_tile(request).filter(|image| {
+                    f64::from(image.width) == x.rect_len
+                        && f64::from(image.height) == y.rect_len
+                        && crate::svg_tile::has_binary_alpha(image)
+                }) {
+                    let quality = to_image_quality(self.style.clone_image_rendering());
+                    let span = Rect::new(
+                        0.0,
+                        0.0,
+                        f64::from(x.count) * x.stride,
+                        f64::from(y.count) * y.stride,
+                    );
+                    scene.fill(
+                        peniko::Fill::NonZero,
+                        placed,
+                        to_peniko_image(&image, quality).as_ref(),
+                        None,
+                        &span,
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Record the tile's vector scene once, then replay the recording per tile.
+        //
+        // `render_svg_tree` walks the usvg tree and rebuilds a `BezPath` for every path it
+        // finds (`anyrender_svg`'s `util::to_bez_path`), so calling it once per tile makes a
+        // full-screen 4x4 stipple pay ~57,600 tree walks and ~115,200 path allocations for a
+        // frame whose visible result is two distinct 1x1 rects. `anyrender::Scene` implements
+        // `PaintScene` itself, so the walk can be done once into a recording and the resulting
+        // commands re-issued with each tile's transform, holding the paths by reference.
+        //
+        // This is byte-identical by construction rather than by measurement, and the grouping
+        // is what makes it so. `render_svg_tree_with` calls `render_group` with
+        // `Affine::IDENTITY` as the local transform and the caller's transform as
+        // `global_transform`, and emits each path at `global_transform * local`. Recording with
+        // `Affine::IDENTITY` as the global transform therefore stores exactly `local`, and
+        // replaying at `tile_transform * local` reproduces the same product with the same
+        // association -- which matters because f64 matrix multiplication is not associative,
+        // so `(A * B) * C` and `A * (B * C)` can differ in the last bits and move a pixel.
+        let mut tile_scene = Scene::new();
+        anyrender_svg::render_svg_tree(&mut tile_scene, &svg.tree, Affine::IDENTITY);
+
+        // `anyrender_svg` emits only fills, strokes and layers, with solid or gradient paints.
+        // Anything else means it gained a command kind this replay does not reproduce
+        // faithfully -- a glyph run, or a paint `Scene` records lossily -- so fall back to
+        // walking the tree per tile, which is by definition the old behaviour.
+        let replayable = tile_scene.commands.iter().all(|command| {
+            matches!(
+                command,
+                RenderCommand::PushLayer(_)
+                    | RenderCommand::PushClipLayer(_)
+                    | RenderCommand::PopLayer
+                    | RenderCommand::Fill(_)
+                    | RenderCommand::Stroke(_)
+            )
+        });
+
         for hc in 0..y.count {
             for wc in 0..x.count {
                 let transform = placed.pre_translate(Vec2 {
@@ -447,7 +569,11 @@ impl ElementCx<'_, '_> {
                     y: hc as f64 * y.stride,
                 }) * svg_transform;
 
-                anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+                if replayable {
+                    replay_recorded_tile(scene, &tile_scene, transform);
+                } else {
+                    anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+                }
             }
         }
     }
@@ -647,6 +773,51 @@ impl ElementCx<'_, '_> {
                     &tile_rect,
                 );
             }
+        }
+    }
+}
+
+/// Re-issue a recorded tile scene into `scene`, with `transform` applied ahead of each
+/// command's own.
+///
+/// The recording is held by reference throughout: `PaintScene`'s methods take the shape as
+/// `&impl Shape` and the paint as `impl Into<PaintRef<'_>>`, so replaying a tile costs a
+/// matrix multiply and a call per command, with no path rebuilt and no brush cloned.
+///
+/// Only the command kinds `anyrender_svg` emits are handled; the caller checks for anything
+/// else once, before the tile loop, and falls back to walking the tree per tile.
+#[cfg(feature = "svg")]
+fn replay_recorded_tile(scene: &mut impl PaintScene, tile: &Scene, transform: Affine) {
+    for command in &tile.commands {
+        match command {
+            RenderCommand::PushLayer(cmd) => scene.push_layer(
+                cmd.blend,
+                cmd.alpha,
+                transform * cmd.transform,
+                &cmd.clip,
+                cmd.filter.clone(),
+                cmd.backdrop_filter.clone(),
+            ),
+            RenderCommand::PushClipLayer(cmd) => {
+                scene.push_clip_layer(transform * cmd.transform, &cmd.clip);
+            }
+            RenderCommand::PopLayer => scene.pop_layer(),
+            RenderCommand::Fill(cmd) => scene.fill(
+                cmd.fill,
+                transform * cmd.transform,
+                &cmd.brush,
+                cmd.brush_transform,
+                &cmd.shape,
+            ),
+            RenderCommand::Stroke(cmd) => scene.stroke(
+                &cmd.style,
+                transform * cmd.transform,
+                &cmd.brush,
+                cmd.brush_transform,
+                &cmd.shape,
+            ),
+            // Filtered out before the tile loop; see `draw_svg_image_layer`.
+            RenderCommand::GlyphRun(_) | RenderCommand::BoxShadow(_) => {}
         }
     }
 }
