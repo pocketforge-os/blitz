@@ -31,6 +31,28 @@ use self::replaced::{
 };
 use self::table::TableTreeWrapper;
 
+/// A CSS box cannot be compressed in the block axis: its min-content block size is the same
+/// quantity as its max-content block size (CSS-SIZING-3 §5.1 — only inline-axis content can
+/// reflow to a narrower size).
+///
+/// Taffy's grid algorithm instead honours `AvailableSpace::MinContent` in the block axis
+/// literally: `compute_free_space` yields zero, so "Maximise Tracks" cannot grow any row past
+/// its base size. When a grid's items are scroll containers their automatic minimum size, and
+/// therefore each row's base size, is zero, and the grid reports a min-content block size near
+/// zero instead of its content height. A parent grid then takes that as the item's minimum
+/// contribution and clamps the whole subtree to the space that happens to be available rather
+/// than letting it overflow, which is what browsers do.
+///
+/// Block layout and flexbox already agree with browsers here, so the adjustment is confined to
+/// the grid dispatch: ask taffy for the max-content block size, which is the value CSS defines
+/// the min-content block size to be.
+fn grid_block_min_content_as_max(mut inputs: taffy::tree::LayoutInput) -> taffy::tree::LayoutInput {
+    if inputs.available_space.height == AvailableSpace::MinContent {
+        inputs.available_space.height = AvailableSpace::MaxContent;
+    }
+    inputs
+}
+
 /// The default object size for replaced elements
 /// (https://drafts.csswg.org/css-images/#default-object-size).
 const DEFAULT_OBJECT_SIZE: taffy::Size<f32> = taffy::Size {
@@ -361,7 +383,9 @@ impl BaseDocument {
                     Display::Block => compute_block_layout(self, node_id, inputs, block_ctx),
                     Display::FlowRoot => compute_block_layout(self, node_id, inputs, None),
                     Display::Flex => compute_flexbox_layout(self, node_id, inputs),
-                    Display::Grid => compute_grid_layout(self, node_id, inputs),
+                    Display::Grid => {
+                        compute_grid_layout(self, node_id, grid_block_min_content_as_max(inputs))
+                    }
                     Display::None => taffy::LayoutOutput::HIDDEN,
                 }
             }
@@ -616,5 +640,140 @@ impl Iterator for RefCellChildIter<'_> {
             self.idx += 1;
             taffy_node_id(*id)
         })
+    }
+}
+
+#[cfg(test)]
+mod grid_block_axis_min_content_tests {
+    use crate::{Attribute, BaseDocument, DocumentConfig, qual_name};
+    use blitz_traits::NodeId;
+    use blitz_traits::shell::{ColorScheme, Viewport};
+
+    /// `* { box-sizing: border-box }` plus the four-tile grid used by every case below. Each
+    /// tile is a scroll container, so its automatic minimum size — and therefore the base size
+    /// of the row it sits in — is zero; its content is 96px (a 92px child plus 2px borders).
+    const STYLESHEET: &str = "
+        * { box-sizing: border-box; margin: 0 }
+        .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px }
+        .tile { border: 2px solid #000; overflow: hidden; display: flex; flex-direction: column }
+        .mini { height: 92px; border-bottom: 2px solid #000 }
+    ";
+
+    struct Boxes {
+        doc: BaseDocument,
+        outer: NodeId,
+        tiles: NodeId,
+        tile: NodeId,
+        mini: NodeId,
+    }
+
+    impl Boxes {
+        fn height(&self, id: NodeId) -> f32 {
+            self.doc.nodes[id].final_layout().size.height
+        }
+    }
+
+    /// `<outer class=outer_class style=outer_style><div class="tiles">` + four tiles.
+    fn build(outer_class: &str, outer_style: &str, tiles_style: &str) -> Boxes {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        doc.add_user_agent_stylesheet(STYLESHEET);
+        let root_id = doc.root_node().id;
+
+        let class = |value: &str| Attribute {
+            name: qual_name!("class"),
+            value: value.to_string(),
+        };
+        let style = |value: &str| Attribute {
+            name: qual_name!("style"),
+            value: value.to_string(),
+        };
+
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(qual_name!("body"), vec![]);
+        let outer = mutator.create_element(
+            qual_name!("div"),
+            vec![class(outer_class), style(outer_style)],
+        );
+        let tiles =
+            mutator.create_element(qual_name!("div"), vec![class("tiles"), style(tiles_style)]);
+
+        let mut first_tile = None;
+        let mut first_mini = None;
+        for _ in 0..4 {
+            let tile = mutator.create_element(qual_name!("div"), vec![class("tile")]);
+            let mini = mutator.create_element(qual_name!("div"), vec![class("mini")]);
+            mutator.append_children(tile, &[mini]);
+            mutator.append_children(tiles, &[tile]);
+            first_tile.get_or_insert(tile);
+            first_mini.get_or_insert(mini);
+        }
+        mutator.append_children(outer, &[tiles]);
+        mutator.append_children(body, &[outer]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+
+        doc.resolve(0.0);
+        Boxes {
+            doc,
+            outer,
+            tiles,
+            tile: first_tile.unwrap(),
+            mini: first_mini.unwrap(),
+        }
+    }
+
+    /// A grid container's min-content size in the block axis is the same quantity as its
+    /// max-content size (CSS-SIZING-3 §5.1): only inline-axis content reflows. Two 96px rows
+    /// and a 10px gap is 202px whichever of the two is asked for.
+    ///
+    /// Taffy applies `AvailableSpace::MinContent` literally in both axes, which zeroes the free
+    /// space so no row can grow past its base size; with scroll-container items those base
+    /// sizes are zero and the nested grid collapses to nearly nothing. Chrome reports the
+    /// values asserted here for this markup.
+    #[test]
+    fn nested_grid_min_content_row_matches_max_content() {
+        let b = build(
+            "panel",
+            "width:600px; display:grid; grid-template-columns:1fr; \
+             grid-template-rows:min-content; border:2px solid #000",
+            "",
+        );
+        assert_eq!(b.height(b.outer), 206.0);
+        assert_eq!(b.height(b.tiles), 202.0);
+        assert_eq!(b.height(b.tile), 96.0);
+        assert_eq!(b.height(b.mini), 92.0);
+    }
+
+    /// The same nested grid inside a flex item that has to shrink. The rows keep their content
+    /// height and overflow the scrollport rather than being squeezed into what the flex line
+    /// left over — the collapsed min-content size would otherwise become the item's minimum
+    /// contribution and clamp the whole subtree.
+    #[test]
+    fn nested_grid_rows_overflow_a_shrunk_scroll_container() {
+        let b = build(
+            "panel",
+            "width:600px; height:150px; display:grid; grid-template-columns:1fr; \
+             min-height:0; overflow:auto; border:2px solid #000; padding:6px",
+            "",
+        );
+        assert_eq!(b.height(b.outer), 150.0);
+        assert_eq!(b.height(b.tiles), 202.0);
+        assert_eq!(b.height(b.tile), 96.0);
+        assert_eq!(b.height(b.mini), 92.0);
+    }
+
+    /// A grid whose own block size is genuinely definite still distributes that space across
+    /// its rows, shrinking scroll-container items below their content height. The fix must not
+    /// turn every definite-height grid into an overflowing one.
+    #[test]
+    fn definite_height_grid_still_shrinks_scroll_container_rows() {
+        let b = build("wrap", "width:600px", "height:150px");
+        assert_eq!(b.height(b.tiles), 150.0);
+        assert_eq!(b.height(b.tile), 70.0);
     }
 }

@@ -1,5 +1,6 @@
 use blitz_traits::node_id::NodeId;
 use core::str;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use markup5ever::{QualName, local_name, ns};
@@ -20,6 +21,7 @@ use thin_vec::ThinVec;
 
 use crate::{
     BaseDocument, ElementData, Node, NodeData,
+    font_metrics::resolve_normal_line_height,
     layout::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
     node::{
         ListItemLayout, ListItemLayoutPosition, Marker, NodeFlags, NodeKind, SpecialElementData,
@@ -862,12 +864,18 @@ fn collect_complex_layout_children(
 }
 
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multiline: bool) {
+    let font_ctx_handle = doc.font_ctx.clone();
+    let mut font_ctx = font_ctx_handle.lock().unwrap();
     let node = &mut doc.nodes[input_element_id];
     let parley_style = node
         .primary_styles()
         .as_ref()
-        .map(|s| stylo_to_parley::style(node.id, s))
+        .map(|s| {
+            let normal_line_height = resolve_normal_line_height(&mut font_ctx, s);
+            stylo_to_parley::style(node.id, s, normal_line_height)
+        })
         .unwrap_or_default();
+    drop(font_ctx);
 
     let element = &mut node.data.downcast_element_mut().unwrap();
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
@@ -1031,9 +1039,27 @@ pub(crate) fn build_inline_layout_into(
             .and_then(|parent_id| nodes[parent_id].primary_styles())
     });
 
+    // `line-height: normal` resolves from the primary font's metrics, and the parley
+    // `TreeBuilder` created below borrows the `FontContext` exclusively for its whole
+    // lifetime. Resolve the whole inline formatting context's `normal` line heights up
+    // front, while the font context is still reachable.
+    let mut normal_line_heights = HashMap::<NodeId, f32>::new();
+    if let Some(before_id) = root_node.before() {
+        collect_normal_line_heights(nodes, font_ctx, before_id, &mut normal_line_heights);
+    }
+    for child_id in root_node.children.iter().copied() {
+        collect_normal_line_heights(nodes, font_ctx, child_id, &mut normal_line_heights);
+    }
+    if let Some(after_id) = root_node.after() {
+        collect_normal_line_heights(nodes, font_ctx, after_id, &mut normal_line_heights);
+    }
+
     let parley_style = root_node_style
         .as_ref()
-        .map(|s| stylo_to_parley::style(inline_context_root_node_id, s))
+        .map(|s| {
+            let normal_line_height = resolve_normal_line_height(font_ctx, s);
+            stylo_to_parley::style(inline_context_root_node_id, s, normal_line_height)
+        })
         .unwrap_or_default();
 
     let root_line_height = resolve_line_height(parley_style.line_height, parley_style.font_size);
@@ -1087,6 +1113,7 @@ pub(crate) fn build_inline_layout_into(
             collapse_mode,
             text_transform,
             root_line_height,
+            &normal_line_heights,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1098,6 +1125,7 @@ pub(crate) fn build_inline_layout_into(
             collapse_mode,
             text_transform,
             root_line_height,
+            &normal_line_heights,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1109,6 +1137,7 @@ pub(crate) fn build_inline_layout_into(
             collapse_mode,
             text_transform,
             root_line_height,
+            &normal_line_heights,
         );
     }
 
@@ -1123,6 +1152,7 @@ pub(crate) fn build_inline_layout_into(
         collapse_mode: WhiteSpaceCollapse,
         parent_text_transform: TextTransform,
         root_line_height: f32,
+        normal_line_heights: &HashMap<NodeId, f32>,
     ) {
         let node = &nodes[node_id];
 
@@ -1180,6 +1210,7 @@ pub(crate) fn build_inline_layout_into(
                                 collapse_mode,
                                 text_transform,
                                 root_line_height,
+                                normal_line_heights,
                             );
                         }
                     }
@@ -1212,7 +1243,13 @@ pub(crate) fn build_inline_layout_into(
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let mut style = node
                                 .primary_styles()
-                                .map(|s| stylo_to_parley::style(node.id, &s))
+                                .map(|s| {
+                                    stylo_to_parley::style(
+                                        node.id,
+                                        &s,
+                                        normal_line_heights.get(&node.id).copied(),
+                                    )
+                                })
                                 .unwrap_or_default();
 
                             // dbg!(&style);
@@ -1240,6 +1277,7 @@ pub(crate) fn build_inline_layout_into(
                                     collapse_mode,
                                     text_transform,
                                     root_line_height,
+                                    normal_line_heights,
                                 );
                             }
 
@@ -1252,6 +1290,7 @@ pub(crate) fn build_inline_layout_into(
                                     collapse_mode,
                                     text_transform,
                                     root_line_height,
+                                    normal_line_heights,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1263,6 +1302,7 @@ pub(crate) fn build_inline_layout_into(
                                     collapse_mode,
                                     text_transform,
                                     root_line_height,
+                                    normal_line_heights,
                                 );
                             }
 
@@ -1305,5 +1345,49 @@ pub(crate) fn build_inline_layout_into(
             }
             NodeData::Document(_) => unreachable!(),
         }
+    }
+}
+
+/// Resolve `line-height: normal` for `node_id` and for every descendant that can
+/// contribute a style span to the same inline formatting context.
+///
+/// This mirrors the descent of `build_inline_layout_recursive`, which only walks into
+/// `display: contents` subtrees and into inline-level flow elements; anything else starts
+/// its own formatting context and is resolved when that context is built. The predicate is
+/// deliberately a superset of the builder's: it may resolve a line height that is never
+/// read (for a replaced element's children, say), but it never misses one the builder
+/// needs.
+fn collect_normal_line_heights(
+    nodes: &crate::NodeTree,
+    font_ctx: &mut FontContext,
+    node_id: NodeId,
+    out: &mut HashMap<NodeId, f32>,
+) {
+    let node = &nodes[node_id];
+
+    if let Some(styles) = node.primary_styles()
+        && let Some(line_height) = resolve_normal_line_height(font_ctx, &styles)
+    {
+        out.insert(node_id, line_height);
+    }
+
+    let display = node.display_style().unwrap_or(Display::inline());
+    let descends = matches!(
+        (display.outside(), display.inside()),
+        (DisplayOutside::None, DisplayInside::Contents)
+            | (DisplayOutside::Inline, DisplayInside::Flow)
+    );
+    if !descends {
+        return;
+    }
+
+    if let Some(before_id) = node.before() {
+        collect_normal_line_heights(nodes, font_ctx, before_id, out);
+    }
+    for child_id in node.children.iter().copied() {
+        collect_normal_line_heights(nodes, font_ctx, child_id, out);
+    }
+    if let Some(after_id) = node.after() {
+        collect_normal_line_heights(nodes, font_ctx, after_id, out);
     }
 }

@@ -1,9 +1,11 @@
 use anyrender::PaintScene;
+use anyrender::filters::{Filter, FilterEffect};
 use blitz_dom::{BaseDocument, NodeId, node::TextBrush, util::ToColorColor};
-use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
+use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke, Vec2};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
-use peniko::Fill;
+use peniko::{Fill, Mix};
 use std::collections::HashMap;
+use std::sync::Arc;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
 use style::values::computed::{
     Length, LengthPercentage, TextDecorationLength, TextDecorationLine, TextUnderlinePosition,
@@ -242,6 +244,7 @@ pub(crate) struct DrawTextContext {
     stack: Vec<DecorationStackEntry>,
     path_scratch: Vec<NodeId>,
     deco_boxes: Vec<LineDecoration>,
+    text_shadows: Vec<(NodeId, Vec<ResolvedTextShadow>)>,
     win_ascent_ratios: WinAscentCache,
 }
 
@@ -538,6 +541,156 @@ fn flush_line_decorations(
     }
 }
 
+/// One `text-shadow` layer of a single element, resolved to device pixels.
+#[derive(Clone)]
+struct ResolvedTextShadow {
+    color: Color,
+    offset: Vec2,
+    /// The standard deviation of the Gaussian. CSS specifies a blur *radius*, which is
+    /// twice the standard deviation (css-backgrounds-3 § 7.1.1, referenced for
+    /// `text-shadow` by css-text-decor-3 § 5).
+    std_dev: f64,
+}
+
+/// Resolve a node's `text-shadow` into paint order: back to front.
+///
+/// `text-shadow` is inherited, so the innermost inline element a glyph run belongs to
+/// already carries the list that applies to it. The shadows are applied front-to-back
+/// with the first in the list on top (css-text-decor-3 § 5), so painting walks the list
+/// in reverse. Fully transparent layers paint nothing and are dropped here.
+fn resolve_text_shadows(
+    doc: &BaseDocument,
+    node_id: NodeId,
+    scale: f64,
+) -> Vec<ResolvedTextShadow> {
+    let Some(styles) = doc.get_node(node_id).and_then(|node| node.primary_styles()) else {
+        return Vec::new();
+    };
+    let current_color = styles.clone_color();
+    styles
+        .get_inherited_text()
+        .text_shadow
+        .0
+        .iter()
+        .rev()
+        .filter_map(|shadow| {
+            let color = shadow
+                .color
+                .resolve_to_absolute(&current_color)
+                .as_srgb_color();
+            (color.components[3] != 0.0).then(|| ResolvedTextShadow {
+                color,
+                offset: Vec2::new(
+                    shadow.horizontal.px() as f64 * scale,
+                    shadow.vertical.px() as f64 * scale,
+                ),
+                std_dev: shadow.blur.px() as f64 * scale / 2.0,
+            })
+        })
+        .collect()
+}
+
+/// Paint the `text-shadow`s of one line's glyph runs.
+///
+/// Called before any of the line's glyphs are drawn, so that a shadow never lands on top
+/// of text it is supposed to sit behind — which a per-run "shadow then glyphs" pass would
+/// do whenever one element's text is split into several runs by a font or bidi boundary.
+///
+/// `cache` memoises the resolved list per node id for the whole inline formatting context;
+/// consecutive runs usually share a node, and the same nodes recur on every line.
+fn draw_line_text_shadows<'a>(
+    scene: &mut impl PaintScene,
+    line: &Line<'a, TextBrush>,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    cache: &mut Vec<(NodeId, Vec<ResolvedTextShadow>)>,
+) {
+    for item in line.items() {
+        let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+            continue;
+        };
+
+        let node_id = glyph_run.style().brush.id;
+        let idx = match cache.iter().position(|(id, _)| *id == node_id) {
+            Some(idx) => idx,
+            None => {
+                cache.push((node_id, resolve_text_shadows(doc, node_id, scale)));
+                cache.len() - 1
+            }
+        };
+        if cache[idx].1.is_empty() {
+            continue;
+        }
+
+        let run = glyph_run.run();
+        let font = run.font();
+        let font_size = run.font_size();
+        let metrics = run.metrics();
+        let glyph_xform = run
+            .synthesis()
+            .skew()
+            .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+        let embolden = if FONT_EMBOLDEN_ENABLED {
+            let fs = font_size as f64 / scale;
+            Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
+        } else {
+            Vec2::default()
+        };
+
+        // The run's inked box, used as the clip of a blurred shadow's layer.
+        let run_box = Rect::new(
+            glyph_run.offset() as f64,
+            (glyph_run.baseline() - metrics.ascent) as f64,
+            (glyph_run.offset() + glyph_run.advance()) as f64,
+            (glyph_run.baseline() + metrics.descent) as f64,
+        );
+
+        for shadow in &cache[idx].1 {
+            let shadow_transform = transform.then_translate(shadow.offset);
+
+            // A Gaussian's support is unbounded, but three standard deviations already
+            // carry 99.7% of it, which is the cutoff browsers use for a shadow's ink area.
+            let blurred = shadow.std_dev > 0.0;
+            if blurred {
+                let pad = shadow.std_dev * 3.0;
+                scene.push_layer(
+                    Mix::Normal,
+                    1.0,
+                    shadow_transform,
+                    &run_box.inflate(pad, pad),
+                    Some(Arc::new(Filter::single(FilterEffect::blur(
+                        shadow.std_dev as f32,
+                    )))),
+                    None,
+                );
+            }
+
+            scene.draw_glyphs(
+                font,
+                font_size,
+                !FONT_EMBOLDEN_ENABLED, // hint
+                run.normalized_coords(),
+                embolden,
+                Fill::NonZero,
+                &anyrender::Paint::from(shadow.color),
+                1.0, // alpha
+                shadow_transform,
+                glyph_xform,
+                glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                    id: glyph.id as _,
+                    x: glyph.x,
+                    y: glyph.y,
+                }),
+            );
+
+            if blurred {
+                scene.pop_layer();
+            }
+        }
+    }
+}
+
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
@@ -551,11 +704,13 @@ pub(crate) fn stroke_text<'a>(
         stack,
         path_scratch,
         deco_boxes,
+        text_shadows,
         win_ascent_ratios,
     } = context;
     stack.clear();
     path_scratch.clear();
     deco_boxes.clear();
+    text_shadows.clear();
 
     // Persistent stack mirroring the ancestor path (inline root -> current run's
     // node) as we walk the runs. The `text-decoration-*` properties are *not*
@@ -570,6 +725,10 @@ pub(crate) fn stroke_text<'a>(
         // draws one decoration per box rather than one stepped segment per differently-sized
         // run. Clearing preserves the allocation for the next line and inline context.
         deco_boxes.clear();
+
+        // `text-shadow` paints underneath the text, so the whole line's shadows go down
+        // before any of its glyphs.
+        draw_line_text_shadows(scene, &line, doc, transform, scale, text_shadows);
 
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {

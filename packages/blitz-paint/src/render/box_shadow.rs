@@ -88,21 +88,35 @@ impl ElementCx<'_, '_> {
 
         let padding_box = self.frame.padding_box_path();
 
-        for shadow in box_shadow.iter().filter(|s| s.inset) {
+        // Shadows are painted front-to-back, the first in the list on top
+        // (css-backgrounds-3 § 7.1), so paint them in reverse as the outset path does.
+        for shadow in box_shadow.iter().filter(|s| s.inset).rev() {
             let shadow_color = shadow
                 .base
                 .color
                 .resolve_to_absolute(&current_color)
                 .as_srgb_color();
             if shadow_color == Color::TRANSPARENT {
-                return;
+                continue;
             }
 
+            // An inset shadow is cast by the *padding* edge (css-backgrounds-3 § 7.1.2):
+            // the shadow fills the padding box everywhere outside an inner shape, and that
+            // inner shape is the padding box shrunk by the spread distance and displaced by
+            // the offsets. Both the fill below and the region punched back out of it are
+            // clipped to the padding box.
+            let spread = shadow.spread.px() as f64 * self.scale;
+            let inner_rect = self.frame.padding_box.inflate(-spread, -spread);
+
             // TODO draw shadows with matching individual radii instead of averaging
-            let radius = self.frame.border_radii.average();
+            let border_width = self.frame.border_width;
+            let mean_border_width =
+                (border_width.x0 + border_width.y0 + border_width.x1 + border_width.y1) / 4.0;
+            let radius = (self.frame.border_radii.average() - mean_border_width - spread).max(0.0);
+
             let transform = self.transform.then_translate(Vec2 {
-                x: shadow.base.horizontal.px() as f64,
-                y: shadow.base.vertical.px() as f64,
+                x: shadow.base.horizontal.px() as f64 * self.scale,
+                y: shadow.base.vertical.px() as f64 * self.scale,
             });
 
             scene.push_layer(Mix::Normal, 1.0, self.transform, &padding_box, None, None);
@@ -124,7 +138,7 @@ impl ElementCx<'_, '_> {
             );
             scene.draw_box_shadow(
                 transform,
-                self.frame.border_box,
+                inner_rect,
                 Color::WHITE,
                 radius,
                 shadow.base.blur.px() as f64 * self.scale,
