@@ -1,7 +1,7 @@
 //! A repeated gradient background is tiled with one fill per tile, and those tiles are
 //! culled to the render surface. The cull must be computed in the space the tiles are
-//! actually placed in: `then_translate` adds to the fill transform's *output* translation,
-//! so the lattice steps along the surface axes, and the surface itself sits at the
+//! actually placed in -- the element's own, since the lattice is applied before the
+//! element's transform -- and the surface it is bounded against sits at the
 //! `initial_x`/`initial_y` offset `paint_scene` was given.
 //!
 //! Both of those were got wrong once. These tests pin them.
@@ -106,12 +106,12 @@ fn tiles_reach_the_far_edge_under_a_nonzero_vertical_offset() {
 /// The tiles that land on a given pixel must not depend on how big the surface is.
 ///
 /// This is the invariant culling has to preserve, and the one that catches a cull computed
-/// in the wrong space. `then_translate` adds to the fill transform's *output* translation,
-/// so the lattice steps along the surface axes while each tile carries the transform's
-/// linear part; a bound derived by inverting the whole transform into the layer's own space
-/// describes a different set of tiles as soon as that linear part is not the identity, and
-/// silently drops some of them. Rendering the same document onto a larger surface and
-/// comparing the shared region catches exactly that, with no golden image and no toggle.
+/// in the wrong space. The lattice is placed *before* the element's transform, so it scales
+/// and rotates with the element; the bound is therefore the surface pulled back through that
+/// transform. Bounding in surface space instead describes a different set of tiles as soon as
+/// the transform's linear part is not the identity, and silently drops some of them.
+/// Rendering the same document onto a larger surface and comparing the shared region catches
+/// exactly that, with no golden image and no toggle.
 #[test]
 fn culling_does_not_depend_on_the_surface_size() {
     const SMALL: u32 = 200;
