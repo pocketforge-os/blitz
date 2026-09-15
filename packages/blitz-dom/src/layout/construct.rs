@@ -21,7 +21,7 @@ use thin_vec::ThinVec;
 
 use crate::{
     BaseDocument, ElementData, Node, NodeData,
-    font_metrics::resolve_normal_line_height,
+    font_metrics::{first_available_font_strut, resolve_normal_strut},
     layout::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
     node::{
         ListItemLayout, ListItemLayoutPosition, Marker, NodeFlags, NodeKind, SpecialElementData,
@@ -289,12 +289,53 @@ fn push_non_whitespace_children_and_pseudos(layout_children: &mut ThinVec<NodeId
 }
 
 /// Convert a relative line height to an absolute one
+///
+/// For `LineHeight::Normal` this is the *strut's* height alone -- the first available font's
+/// rounded ascent plus rounded descent. It is a nominal value: the used height of a `normal`
+/// line is only known once every run on the line is known, because a font other than the first
+/// available one may be taller (css-inline-3 §5.3). Callers that need the used height must read
+/// it back from the parley layout.
 fn resolve_line_height(line_height: parley::LineHeight, font_size: f32) -> f32 {
     match line_height {
         parley::LineHeight::FontSizeRelative(relative) => relative * font_size,
         parley::LineHeight::Absolute(absolute) => absolute,
         parley::LineHeight::MetricsRelative(relative) => relative * font_size, //unreachable!(),
+        parley::LineHeight::Normal {
+            strut_ascent,
+            strut_descent,
+        } => strut_ascent.round() + strut_descent.round(),
     }
+}
+
+/// The strut of an inline formatting context.
+///
+/// Every block container contributes "an imaginary inline box with the font and line-height of
+/// the block" to each of its line boxes (CSS 2.1 §10.8.1), so the block's own font bounds its
+/// lines even where no glyph is drawn from it.
+#[derive(Clone, Copy)]
+struct InlineContextStrut {
+    /// The block's own resolved `line-height`.
+    line_height: f32,
+    /// The block's first available font's ascent and descent with the leading distributed --
+    /// each metric rounded first and the larger half of the leading given below, as Chromium's
+    /// `FontHeight::AddLeading` does -- so the pair sums to exactly `line_height`.
+    ///
+    /// `None` when no family in the block's list resolves to a real face.
+    bounds: Option<(f32, f32)>,
+}
+
+/// The strut state threaded through the construction of one inline formatting context.
+///
+/// The block's own strut bounds every line box in the context; each descendant that computes
+/// `line-height: normal` additionally contributes its own first available font, so both travel
+/// together down the same recursion.
+#[derive(Clone, Copy)]
+struct InlineStruts<'a> {
+    /// The strut of the block establishing this inline formatting context.
+    root: InlineContextStrut,
+    /// First available font ascent/descent of each descendant computing `line-height: normal`,
+    /// keyed by node. Absent for nodes whose `line-height` is a length or a number.
+    by_node: &'a HashMap<NodeId, (f32, f32)>,
 }
 
 /// Result of classifying the in-flow children of a flow container as
@@ -871,8 +912,8 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         .primary_styles()
         .as_ref()
         .map(|s| {
-            let normal_line_height = resolve_normal_line_height(&mut font_ctx, s);
-            stylo_to_parley::style(node.id, s, normal_line_height)
+            let normal_strut = resolve_normal_strut(&mut font_ctx, s);
+            stylo_to_parley::style(node.id, s, normal_strut)
         })
         .unwrap_or_default();
     drop(font_ctx);
@@ -1043,26 +1084,40 @@ pub(crate) fn build_inline_layout_into(
     // `TreeBuilder` created below borrows the `FontContext` exclusively for its whole
     // lifetime. Resolve the whole inline formatting context's `normal` line heights up
     // front, while the font context is still reachable.
-    let mut normal_line_heights = HashMap::<NodeId, f32>::new();
+    let mut normal_struts = HashMap::<NodeId, (f32, f32)>::new();
     if let Some(before_id) = root_node.before() {
-        collect_normal_line_heights(nodes, font_ctx, before_id, &mut normal_line_heights);
+        collect_normal_struts(nodes, font_ctx, before_id, &mut normal_struts);
     }
     for child_id in root_node.children.iter().copied() {
-        collect_normal_line_heights(nodes, font_ctx, child_id, &mut normal_line_heights);
+        collect_normal_struts(nodes, font_ctx, child_id, &mut normal_struts);
     }
     if let Some(after_id) = root_node.after() {
-        collect_normal_line_heights(nodes, font_ctx, after_id, &mut normal_line_heights);
+        collect_normal_struts(nodes, font_ctx, after_id, &mut normal_struts);
     }
 
     let parley_style = root_node_style
         .as_ref()
         .map(|s| {
-            let normal_line_height = resolve_normal_line_height(font_ctx, s);
-            stylo_to_parley::style(inline_context_root_node_id, s, normal_line_height)
+            let normal_strut = resolve_normal_strut(font_ctx, s);
+            stylo_to_parley::style(inline_context_root_node_id, s, normal_strut)
         })
         .unwrap_or_default();
 
-    let root_line_height = resolve_line_height(parley_style.line_height, parley_style.font_size);
+    let line_height = resolve_line_height(parley_style.line_height, parley_style.font_size);
+    let root_strut = InlineContextStrut {
+        line_height,
+        bounds: root_node_style.as_ref().and_then(|s| {
+            let (ascent, descent) = first_available_font_strut(font_ctx, s)?;
+            let (ascent, descent) = (ascent.round(), descent.round());
+            let leading = line_height - (ascent + descent);
+            let above = (leading * 0.5).floor();
+            Some((ascent + above, descent + (leading - above)))
+        }),
+    };
+    let struts = InlineStruts {
+        root: root_strut,
+        by_node: &normal_struts,
+    };
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
@@ -1112,8 +1167,7 @@ pub(crate) fn build_inline_layout_into(
             before_id,
             collapse_mode,
             text_transform,
-            root_line_height,
-            &normal_line_heights,
+            struts,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1124,8 +1178,7 @@ pub(crate) fn build_inline_layout_into(
             child_id,
             collapse_mode,
             text_transform,
-            root_line_height,
-            &normal_line_heights,
+            struts,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1136,8 +1189,7 @@ pub(crate) fn build_inline_layout_into(
             after_id,
             collapse_mode,
             text_transform,
-            root_line_height,
-            &normal_line_heights,
+            struts,
         );
     }
 
@@ -1151,8 +1203,7 @@ pub(crate) fn build_inline_layout_into(
         node_id: NodeId,
         collapse_mode: WhiteSpaceCollapse,
         parent_text_transform: TextTransform,
-        root_line_height: f32,
-        normal_line_heights: &HashMap<NodeId, f32>,
+        struts: InlineStruts<'_>,
     ) {
         let node = &nodes[node_id];
 
@@ -1209,8 +1260,7 @@ pub(crate) fn build_inline_layout_into(
                                 child_id,
                                 collapse_mode,
                                 text_transform,
-                                root_line_height,
-                                normal_line_heights,
+                                struts,
                             );
                         }
                     }
@@ -1247,7 +1297,7 @@ pub(crate) fn build_inline_layout_into(
                                     stylo_to_parley::style(
                                         node.id,
                                         &s,
-                                        normal_line_heights.get(&node.id).copied(),
+                                        struts.by_node.get(&node.id).copied(),
                                     )
                                 })
                                 .unwrap_or_default();
@@ -1256,12 +1306,38 @@ pub(crate) fn build_inline_layout_into(
 
                             let font_size = style.font_size;
 
-                            // Floor the line-height of the span by the line-height of the inline context
+                            // Floor the span by the inline context's strut.
                             // See https://www.w3.org/TR/CSS21/visudet.html#line-height
-                            style.line_height = parley::LineHeight::Absolute(
-                                resolve_line_height(style.line_height, font_size)
-                                    .max(root_line_height),
-                            );
+                            //
+                            // A `normal` span stays `normal`, so that a run resolving to a
+                            // taller fallback font still grows the line box (css-inline-3 §5.3).
+                            // The floor is applied to its layout *bounds* rather than by
+                            // collapsing it to a fixed height: collapsing re-pins the line to
+                            // the span's first available font, which is the defect this avoids,
+                            // and it did so for every span whose own strut sat below the floor.
+                            //
+                            // The strut pair sums to the block's line height, so a span drawing only
+                            // from its own first available font lands on exactly the height the
+                            // scalar floor produced.
+                            style.line_height = match (style.line_height, struts.root.bounds) {
+                                (
+                                    parley::LineHeight::Normal {
+                                        strut_ascent,
+                                        strut_descent,
+                                    },
+                                    Some((root_ascent, root_descent)),
+                                ) => parley::LineHeight::Normal {
+                                    strut_ascent: strut_ascent.max(root_ascent),
+                                    strut_descent: strut_descent.max(root_descent),
+                                },
+                                (line_height @ parley::LineHeight::Normal { .. }, None) => {
+                                    line_height
+                                }
+                                (line_height, _) => parley::LineHeight::Absolute(
+                                    resolve_line_height(line_height, font_size)
+                                        .max(struts.root.line_height),
+                                ),
+                            };
 
                             // dbg!(node_id);
                             // dbg!(&style);
@@ -1276,8 +1352,7 @@ pub(crate) fn build_inline_layout_into(
                                     before_id,
                                     collapse_mode,
                                     text_transform,
-                                    root_line_height,
-                                    normal_line_heights,
+                                    struts,
                                 );
                             }
 
@@ -1289,8 +1364,7 @@ pub(crate) fn build_inline_layout_into(
                                     child_id,
                                     collapse_mode,
                                     text_transform,
-                                    root_line_height,
-                                    normal_line_heights,
+                                    struts,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1301,8 +1375,7 @@ pub(crate) fn build_inline_layout_into(
                                     after_id,
                                     collapse_mode,
                                     text_transform,
-                                    root_line_height,
-                                    normal_line_heights,
+                                    struts,
                                 );
                             }
 
@@ -1357,18 +1430,18 @@ pub(crate) fn build_inline_layout_into(
 /// deliberately a superset of the builder's: it may resolve a line height that is never
 /// read (for a replaced element's children, say), but it never misses one the builder
 /// needs.
-fn collect_normal_line_heights(
+fn collect_normal_struts(
     nodes: &crate::NodeTree,
     font_ctx: &mut FontContext,
     node_id: NodeId,
-    out: &mut HashMap<NodeId, f32>,
+    out: &mut HashMap<NodeId, (f32, f32)>,
 ) {
     let node = &nodes[node_id];
 
     if let Some(styles) = node.primary_styles()
-        && let Some(line_height) = resolve_normal_line_height(font_ctx, &styles)
+        && let Some(strut) = resolve_normal_strut(font_ctx, &styles)
     {
-        out.insert(node_id, line_height);
+        out.insert(node_id, strut);
     }
 
     let display = node.display_style().unwrap_or(Display::inline());
@@ -1382,12 +1455,12 @@ fn collect_normal_line_heights(
     }
 
     if let Some(before_id) = node.before() {
-        collect_normal_line_heights(nodes, font_ctx, before_id, out);
+        collect_normal_struts(nodes, font_ctx, before_id, out);
     }
     for child_id in node.children.iter().copied() {
-        collect_normal_line_heights(nodes, font_ctx, child_id, out);
+        collect_normal_struts(nodes, font_ctx, child_id, out);
     }
     if let Some(after_id) = node.after() {
-        collect_normal_line_heights(nodes, font_ctx, after_id, out);
+        collect_normal_struts(nodes, font_ctx, after_id, out);
     }
 }
