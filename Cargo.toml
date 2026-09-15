@@ -318,3 +318,13 @@ rustc-hash = { workspace = true }
 # parley = { path = "../parley/parley" }
 # fontique = { path = "../parley/fontique" }
 
+# Our fork of parley v0.11.1, on branch `fix/normal-line-height-unions-used-fonts`:
+# the exact upstream release this workspace depends on, plus one fix, open
+# upstreamable against `pf/base-v0.11.1`.
+#   1. `LineHeight::Normal`, so a `line-height: normal` line box is sized from
+#      every font used on the line rather than from the first available font
+#      alone (css-inline-3 s5.3).
+#      https://github.com/pocketforge-os/parley/pull/1  (tsp-f3fm.125)
+# Exact rev, never a branch tip; also tagged `poolsuite-pin/3041ab230121`.
+[patch.crates-io]
+parley = { git = "https://github.com/pocketforge-os/parley.git", rev = "3041ab23012124ad4b60fc13a904a399772098ae" }
