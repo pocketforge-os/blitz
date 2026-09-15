@@ -5,6 +5,7 @@
 @namespace url(http://www.w3.org/1999/xhtml);
 /* set default namespace to HTML */
 @namespace xul url(http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul);
+@namespace svg url(http://www.w3.org/2000/svg);
 
 @font-face {
     font-family: -moz-bullet-font;
@@ -813,6 +814,24 @@ spacer {
 
 canvas {
     user-select: none;
+}
+
+/* An `svg` element that is not the root of a stand-alone document establishes
+ * a new viewport, and SVG 2 s3.11 puts it in the User Agent style sheet with
+ * `overflow: hidden`: "In the User Agent style sheet, overflow is overridden
+ * for the 'svg' element when it is not the root element of a stand-alone
+ * document, the 'pattern' element, and the 'marker' element to be hidden by
+ * default."  (`pattern` and `marker` never reach box layout here, so only the
+ * viewport-establishing `svg` element is declared.)
+ *
+ * Without this the element's computed overflow stays `visible`, and
+ * css-flexbox-1 s4.5 then gives an inline `<svg>` flex item a content-based
+ * automatic minimum size instead of zero, so it cannot shrink below its
+ * specified width and pushes its siblings out of the flex container.
+ * https://svgwg.org/svg2-draft/render.html#OverflowAndClipProperties
+ */
+svg|svg:not(:root) {
+    overflow: hidden;
 }
 
 iframe:focus-visible,
