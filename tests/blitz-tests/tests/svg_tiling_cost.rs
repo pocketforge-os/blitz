@@ -8,13 +8,16 @@
 //! `#[ignore]` so the timing never runs as part of the ordinary suite, where it would be
 //! both slow and meaningless (a debug number is not comparable).
 
-use anyrender::render_to_buffer;
+use anyrender::{PaintScene, render_to_buffer};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_dom::node::{ImageData, RasterImageData, SvgImageData};
 use blitz_html::{HtmlDocument, HtmlProvider};
-use blitz_paint::paint_scene;
+use blitz_paint::{SvgTileRasterizer, SvgTileRequest, paint_scene, paint_scene_with_tiles};
 use blitz_traits::shell::{ColorScheme, Viewport};
+use kurbo::Affine;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -163,6 +166,70 @@ fn build(w: u32, h: u32, el_h: u32) -> HtmlDocument {
     doc
 }
 
+/// The embedder side of the tile seam, shaped the way a real one is: rasterise through the
+/// same renderer that draws the scene, and cache across frames.
+#[derive(Default)]
+struct CachingRasterizer {
+    cache: RefCell<HashMap<(usize, u32, u32), RasterImageData>>,
+    keepalive: RefCell<Vec<Arc<usvg::Tree>>>,
+}
+
+impl SvgTileRasterizer for CachingRasterizer {
+    fn rasterize_svg_tile(&self, request: SvgTileRequest<'_>) -> Option<RasterImageData> {
+        let key = (
+            Arc::as_ptr(request.tree) as usize,
+            request.width,
+            request.height,
+        );
+        if let Some(hit) = self.cache.borrow().get(&key) {
+            return Some(hit.clone());
+        }
+        let scene = request.scene.clone();
+        let pixels = render_to_buffer::<VelloCpuImageRenderer, _>(
+            move |target| target.append_scene(scene, Affine::IDENTITY),
+            request.width,
+            request.height,
+        );
+        let image = RasterImageData::new(request.width, request.height, Arc::new(pixels));
+        self.keepalive.borrow_mut().push(request.tree.clone());
+        self.cache.borrow_mut().insert(key, image.clone());
+        Some(image)
+    }
+}
+
+/// `time_doc`, painting through `paint_scene_with_tiles` with a warm tile cache.
+fn time_doc_with_tiles(label: &str, mut doc: HtmlDocument, w: u32, h: u32, runs: u32) -> f64 {
+    let rasterizer = CachingRasterizer::default();
+    let _ = render_to_buffer::<VelloCpuImageRenderer, _>(
+        |scene| paint_scene_with_tiles(scene, doc.as_mut(), 1.0, w, h, 0, 0, &rasterizer),
+        w,
+        h,
+    );
+    assert!(
+        !rasterizer.cache.borrow().is_empty(),
+        "{label}: the tile path was never taken, so this measures nothing"
+    );
+    let mut best = f64::MAX;
+    let mut total = 0.0;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let buf = render_to_buffer::<VelloCpuImageRenderer, _>(
+            |scene| paint_scene_with_tiles(scene, doc.as_mut(), 1.0, w, h, 0, 0, &rasterizer),
+            w,
+            h,
+        );
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(&buf);
+        total += ms;
+        best = best.min(ms);
+    }
+    println!(
+        "{label:<40} best={best:8.2}ms  mean={:8.2}ms",
+        total / runs as f64
+    );
+    best
+}
+
 fn time_doc(label: &str, mut doc: HtmlDocument, w: u32, h: u32, runs: u32) -> f64 {
     // One warm-up frame so allocation and any lazily-built state is not in the sample.
     let _ = render_to_buffer::<VelloCpuImageRenderer, _>(
@@ -255,6 +322,14 @@ fn dither_frame_cost() {
         H,
         RUNS,
     );
+    // The fix: the SVG tile rasterised once and tiled by a repeating brush in one fill.
+    let tiled = time_doc_with_tiles(
+        "SVG tile via paint_scene_with_tiles",
+        build(W, H, H),
+        W,
+        H,
+        RUNS,
+    );
     // The floor: the identical visible result through the single-fill raster brush path.
     let raster = time_doc(
         "same stipple as a raster tile (1 fill)",
@@ -273,11 +348,12 @@ fn dither_frame_cost() {
     );
 
     println!(
-        "\ntiling cost: SVG {:.2} ms vs raster {:.2} ms over a {:.2} ms bare frame -- \
-         a {:.1}x gap to the single-fill floor\n",
+        "\ntiling cost over a {bare:.2} ms bare frame: vector replay {:.2} ms, rasterised \
+         tile {:.2} ms, raster-image floor {:.2} ms\n\
+         60 fps budget 16.70 ms -- rasterised-tile frame {tiled:.2} ms: {}\n",
         svg - bare,
+        tiled - bare,
         raster - bare,
-        bare,
-        (svg - bare) / (raster - bare).max(0.001)
+        if tiled <= 16.7 { "INSIDE" } else { "OVER" }
     );
 }

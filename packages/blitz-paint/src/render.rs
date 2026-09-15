@@ -127,10 +127,16 @@ pub struct BlitzDomPainter<'dom, 'a> {
 
     // Pre-computed `Scene`s for each CustomWidget
     pub(crate) custom_widget_scenes: &'a CustomWidgetSceneMap,
+
+    /// A rasteriser lent by the embedder for repeating SVG background tiles, if it offered
+    /// one. See [`crate::paint_scene_with_tiles`].
+    #[cfg(feature = "svg")]
+    pub(crate) svg_tile_rasterizer: Option<&'a dyn crate::SvgTileRasterizer>,
 }
 
 impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     /// Create a new BlitzDomPainter for the given document
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dom: &'dom BaseDocument,
         scale: f64,
@@ -139,6 +145,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         initial_x: f64,
         initial_y: f64,
         custom_widget_scenes: &'a CustomWidgetSceneMap,
+        #[cfg(feature = "svg")] svg_tile_rasterizer: Option<&'a dyn crate::SvgTileRasterizer>,
     ) -> Self {
         let selection_ranges: HashMap<NodeId, (usize, usize)> = dom
             .get_text_selection_ranges()
@@ -165,6 +172,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             draw_text_context: RefCell::new(DrawTextContext::default()),
             selection_ranges,
             custom_widget_scenes,
+            #[cfg(feature = "svg")]
+            svg_tile_rasterizer,
         }
     }
 
@@ -1205,6 +1214,8 @@ impl ElementCx<'_, '_> {
                 initial_x,
                 initial_y,
                 self.custom_widget_scenes,
+                #[cfg(feature = "svg")]
+                self.svg_tile_rasterizer,
             );
             painter.paint_scene(scene);
         }
