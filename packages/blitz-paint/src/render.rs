@@ -480,6 +480,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     convert_filters(&effects.filter.0).map(Arc::new)
                 };
                 let color_matrix = color_matrix.filter(|chain| !chain.is_identity());
+                let color_matrix_needs_group = color_matrix
+                    .as_ref()
+                    .is_some_and(|chain| !chain.can_rewrite_paints_exactly());
                 let backdrop_filter = convert_filters(&effects.backdrop_filter.0).map(Arc::new);
 
                 // Adjust effect layer clip by filter expansion area
@@ -506,7 +509,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 self.layer_manager.maybe_with_layer(
                     scene,
                     has_opacity
-                        || color_matrix.is_some()
+                        || color_matrix_needs_group
                         || filter.is_some()
                         || backdrop_filter.is_some(),
                     opacity,
@@ -526,6 +529,17 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 unscrolled_transform,
                             );
 
+                            // If every intermediate maps the in-gamut RGB cube
+                            // back into itself, no clamp can fire and the affine
+                            // colour map commutes with source-over. Rewriting the
+                            // recorded paints is then exact and avoids a pixel
+                            // round trip through an offscreen buffer.
+                            if chain.can_rewrite_paints_exactly() {
+                                chain.apply_to_scene(&mut group);
+                                scene.append_scene(group, Affine::IDENTITY);
+                                return;
+                            }
+
                             #[cfg(feature = "vello-cpu-filters")]
                             {
                                 let surface = Rect::from_origin_size(
@@ -535,7 +549,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 let bounds = cx
                                     .transform
                                     .transform_rect_bbox(effect_layer_clip)
-                                    .intersect(surface);
+                                    .intersect(surface)
+                                    // `clip_rect` is in viewport coordinates;
+                                    // the recorded scene uses device coordinates
+                                    // including the paint call's initial offset.
+                                    .intersect(Rect::new(
+                                        clip_rect.x0 + cx.initial_x,
+                                        clip_rect.y0 + cx.initial_y,
+                                        clip_rect.x1 + cx.initial_x,
+                                        clip_rect.y1 + cx.initial_y,
+                                    ));
                                 match chain.rasterize_composited_scene(group, bounds) {
                                     Ok((image, transform)) => {
                                         scene.draw_image(image.as_ref(), transform);

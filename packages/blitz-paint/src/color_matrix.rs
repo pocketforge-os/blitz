@@ -38,12 +38,20 @@
 //! together as a group with the filter effect applied to the group as a whole."
 //! <https://drafts.csswg.org/filter-effects-1/#FilterProperty>
 //!
-//! With `vello-cpu-filters`, the subtree is recorded, rasterised into a bounded
-//! premultiplied RGBA buffer, transformed one pixel at a time, and then
-//! composited into the parent. The clamp belongs here, after the subtree has
-//! composited. Applying and clamping the matrix to each source paint is not
-//! equivalent: a translucent white source can clamp before its coverage is
-//! mixed with a dark destination, producing a different result.
+//! With `vello-cpu-filters`, a chain that can clamp records its subtree,
+//! rasterises it into a bounded premultiplied RGBA buffer, transforms the
+//! composited pixels, and then composites that image into the parent. The clamp
+//! belongs after the subtree has composited. Applying and clamping the matrix to
+//! each source paint is not equivalent: a translucent white source can clamp
+//! before its coverage is mixed with a dark destination, producing a different
+//! result.
+//!
+//! There is an exact fast path when every intermediate affine map keeps the RGB
+//! cube inside `[0,1]`, leaves alpha unchanged, and has no alpha term in a colour
+//! row. With no effective clamp, an affine colour map commutes with source-over:
+//! an opaque group's output colour is a weighted average of its sources and the
+//! weights sum to one. All eight cube vertices are propagated through every
+//! stage because an affine function reaches its extrema over a cube at a vertex.
 //!
 //! The pinned Vello CPU renderer does not execute colour-matrix primitives and
 //! its multithreaded dispatcher rejects every filter layer, so `blitz-paint`
@@ -70,6 +78,10 @@ use smallvec::SmallVec;
 #[cfg(feature = "vello-cpu-filters")]
 use std::cell::RefCell;
 use std::sync::Arc;
+#[cfg(feature = "vello-cpu-filters")]
+use std::sync::LazyLock;
+#[cfg(all(test, feature = "vello-cpu-filters"))]
+use std::time::{Duration, Instant};
 
 use crate::color::Color;
 use crate::filters::StyloFilter;
@@ -80,12 +92,39 @@ use crate::filters::StyloFilter;
 /// chain cannot grow the ramp without bound.
 const MAX_SEGMENT_STOPS: usize = 32;
 
+/// `1 / alpha_byte` for unpremultiplication. Index zero is never read: fully
+/// transparent pixels are skipped before the lookup.
+#[cfg(feature = "vello-cpu-filters")]
+static UNPREMULTIPLY_RGBA8: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    let mut reciprocals = [0.0; 256];
+    for (alpha, reciprocal) in reciprocals.iter_mut().enumerate().skip(1) {
+        *reciprocal = 1.0 / alpha as f32;
+    }
+    reciprocals
+});
+
 #[cfg(feature = "vello-cpu-filters")]
 thread_local! {
     /// Keep one renderer's scratch allocations warm without retaining one
     /// framebuffer for every distinct animated element size ever observed.
     static FILTER_RENDERER: RefCell<Option<(u32, u32, VelloCpuImageRenderer)>> =
         const { RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "vello-cpu-filters"))]
+#[derive(Clone, Copy, Debug, Default)]
+struct GroupFilterProfile {
+    offscreen_render: Duration,
+    matrix_pass: Duration,
+}
+
+#[cfg(all(test, feature = "vello-cpu-filters"))]
+thread_local! {
+    static LAST_GROUP_FILTER_PROFILE: RefCell<GroupFilterProfile> =
+        const { RefCell::new(GroupFilterProfile {
+            offscreen_render: Duration::ZERO,
+            matrix_pass: Duration::ZERO,
+        }) };
 }
 
 /// Published luminance coefficients for `feColorMatrix type="saturate"` and
@@ -323,6 +362,48 @@ impl ColorMatrixChain {
         self.0.iter().all(|m| *m == ColorMatrix::IDENTITY)
     }
 
+    /// Whether rewriting each recorded paint is mathematically identical to
+    /// filtering the composited group.
+    ///
+    /// The eight RGB-cube vertices are propagated through every stage and each
+    /// intermediate result must remain in gamut. An affine map reaches every
+    /// component's extrema over the current convex polytope at one of those
+    /// propagated vertices, so this proves that no stage's clamp can change a
+    /// value. Alpha invariance and colour-row independence from alpha are
+    /// checked explicitly rather than inferred from the constructors.
+    pub(crate) fn can_rewrite_paints_exactly(&self) -> bool {
+        let mut vertices: [[f32; 3]; 8] = std::array::from_fn(|corner| {
+            [
+                (corner & 1) as f32,
+                ((corner >> 1) & 1) as f32,
+                ((corner >> 2) & 1) as f32,
+            ]
+        });
+
+        for matrix in &self.0 {
+            let m = &matrix.0;
+            let color_rows_ignore_alpha = m[3] == 0.0 && m[8] == 0.0 && m[13] == 0.0;
+            let alpha_is_identity =
+                m[15] == 0.0 && m[16] == 0.0 && m[17] == 0.0 && m[18] == 1.0 && m[19] == 0.0;
+            if !color_rows_ignore_alpha || !alpha_is_identity {
+                return false;
+            }
+
+            for vertex in &mut vertices {
+                let input = [vertex[0], vertex[1], vertex[2], 1.0];
+                let output = matrix.apply_vector(input, false);
+                if output[..3]
+                    .iter()
+                    .any(|component| !(0.0..=1.0).contains(component))
+                {
+                    return false;
+                }
+                vertex.copy_from_slice(&output[..3]);
+            }
+        }
+        true
+    }
+
     fn apply(&self, color: Color) -> Color {
         self.0.iter().fold(color, |acc, m| m.apply(acc))
     }
@@ -337,6 +418,11 @@ impl ColorMatrixChain {
     /// The normative requirement is: "All the elements descendants are rendered
     /// together as a group with the filter effect applied to the group as a whole."
     /// <https://drafts.csswg.org/filter-effects-1/#FilterProperty>
+    ///
+    /// `bounds` is already intersected with the surface and active ancestor
+    /// clip. Both the retained renderer and the uploaded image are exactly that
+    /// size, so reset, rasterisation, and upload never touch pixels outside the
+    /// visible filter rectangle.
     #[cfg(feature = "vello-cpu-filters")]
     pub(crate) fn rasterize_composited_scene(
         &self,
@@ -369,14 +455,27 @@ impl ColorMatrixChain {
             .unwrap_or_else(|| VelloCpuImageRenderer::new(width, height));
         renderer.reset();
         let mut pixels = Vec::new();
+        #[cfg(test)]
+        let offscreen_start = Instant::now();
         renderer.render_to_vec(
             move |target| target.append_scene(scene, offset),
             &mut pixels,
         );
+        #[cfg(test)]
+        let offscreen_render = offscreen_start.elapsed();
         FILTER_RENDERER.with(|cached| {
             cached.borrow_mut().replace((width, height, renderer));
         });
+        #[cfg(test)]
+        let matrix_start = Instant::now();
         self.apply_to_premultiplied_rgba8(&mut pixels);
+        #[cfg(test)]
+        LAST_GROUP_FILTER_PROFILE.with(|profile| {
+            *profile.borrow_mut() = GroupFilterProfile {
+                offscreen_render,
+                matrix_pass: matrix_start.elapsed(),
+            };
+        });
 
         let image = ImageBrush {
             image: ImageData {
@@ -399,11 +498,12 @@ impl ColorMatrixChain {
     #[cfg(feature = "vello-cpu-filters")]
     fn apply_to_premultiplied_rgba8(&self, pixels: &mut [u8]) {
         for pixel in pixels.as_chunks_mut::<4>().0 {
-            let alpha = f32::from(pixel[3]) / 255.0;
-            if alpha == 0.0 {
+            let alpha_byte = usize::from(pixel[3]);
+            if alpha_byte == 0 {
                 continue;
             }
-            let unpremultiply = 1.0 / (255.0 * alpha);
+            let alpha = alpha_byte as f32 / 255.0;
+            let unpremultiply = UNPREMULTIPLY_RGBA8[alpha_byte];
             let source = Color::new([
                 f32::from(pixel[0]) * unpremultiply,
                 f32::from(pixel[1]) * unpremultiply,
@@ -707,6 +807,11 @@ fn clamp_vector(mut vector: [f32; 4], premultiplied: bool) -> [f32; 4] {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "vello-cpu-filters")]
+    use kurbo::{Circle, Rect};
+    #[cfg(feature = "vello-cpu-filters")]
+    use peniko::Fill;
+
     fn rgb(color: Color) -> [u8; 3] {
         let c = color.to_rgba8();
         [c.r, c.g, c.b]
@@ -805,6 +910,189 @@ mod tests {
             ColorMatrix::sepia(1.0),
         ] {
             assert_eq!(m.apply(translucent).components[3], 0.4);
+        }
+    }
+
+    #[test]
+    fn clamp_free_chains_are_classified_from_every_intermediate_cube() {
+        let qualifying = [
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::invert(1.0)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::brightness(0.55)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::contrast(0.5)])),
+            ColorMatrixChain(SmallVec::from_slice(&[
+                ColorMatrix::brightness(0.8),
+                ColorMatrix::contrast(0.5),
+                ColorMatrix::invert(0.25),
+            ])),
+        ];
+        for chain in qualifying {
+            assert!(
+                chain.can_rewrite_paints_exactly(),
+                "expected a clamp-free chain: {chain:?}"
+            );
+        }
+
+        let clamping = [
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::brightness(1.01)])),
+            ColorMatrixChain(SmallVec::from_slice(&[
+                ColorMatrix::brightness(0.55),
+                ColorMatrix::contrast(1.2),
+            ])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::hue_rotate(
+                61.0_f32.to_radians(),
+            )])),
+        ];
+        for chain in clamping {
+            assert!(
+                !chain.can_rewrite_paints_exactly(),
+                "expected a potentially clamping chain: {chain:?}"
+            );
+        }
+    }
+
+    /// A deterministic generator is enough here: this is a renderer invariant,
+    /// not a distribution test. Every scene contains an opaque backdrop,
+    /// translucent overlaps, antialiased circles, and two nested clip groups.
+    /// Comparing the paint rewrite with the offscreen group path also
+    /// guards the assumption that both paths do their arithmetic in the same
+    /// colour space.
+    #[cfg(feature = "vello-cpu-filters")]
+    #[test]
+    fn clamp_free_paint_rewrite_matches_group_filter_for_randomized_scenes() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 64;
+
+        fn random(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((*state >> 40) as u32) as f32 / ((1_u32 << 24) - 1) as f32
+        }
+
+        fn random_component(state: &mut u64) -> f32 {
+            (random(state) * 255.0).round() / 255.0
+        }
+
+        fn randomized_scene(seed: u64) -> Scene {
+            let mut state = seed;
+            let mut scene = Scene::default();
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::new([
+                    random_component(&mut state),
+                    random_component(&mut state),
+                    random_component(&mut state),
+                    1.0,
+                ]),
+                None,
+                &Rect::new(0.0, 0.0, f64::from(WIDTH), f64::from(HEIGHT)),
+            );
+
+            for layer in 0..2 {
+                let inset = f64::from(3 + layer * 7);
+                let clip = Rect::new(inset, inset, 64.0 - inset, 64.0 - inset);
+                scene.push_clip_layer(Affine::IDENTITY, &clip);
+                for _ in 0..4 {
+                    let x = f64::from((random(&mut state) * 58.0 + 3.0).floor());
+                    let y = f64::from((random(&mut state) * 58.0 + 3.0).floor());
+                    let radius = f64::from((random(&mut state) * 10.0 + 2.0).floor());
+                    let color = Color::new([
+                        random_component(&mut state),
+                        random_component(&mut state),
+                        random_component(&mut state),
+                        1.0,
+                    ]);
+                    scene.fill(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        color,
+                        None,
+                        &Rect::new(x - radius, y - radius, x + radius, y + radius),
+                    );
+                }
+            }
+            scene.pop_layer();
+            scene.pop_layer();
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::BLACK,
+                None,
+                &Rect::new(4.0, 52.0, 28.0, 62.0),
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::new([1.0, 1.0, 1.0, 0.5]),
+                None,
+                &Rect::new(12.0, 52.0, 36.0, 62.0),
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::BLACK,
+                None,
+                &Rect::new(44.0, 44.0, 64.0, 64.0),
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::WHITE,
+                None,
+                &Circle::new((54.0, 54.0), 8.0),
+            );
+            scene
+        }
+
+        fn render(scene: Scene) -> Vec<u8> {
+            let mut renderer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
+            let mut pixels = Vec::new();
+            renderer.render_to_vec(
+                move |target| target.append_scene(scene, Affine::IDENTITY),
+                &mut pixels,
+            );
+            pixels
+        }
+
+        let chains = [
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::invert(1.0)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::brightness(0.55)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::contrast(0.5)])),
+            ColorMatrixChain(SmallVec::from_slice(&[
+                ColorMatrix::brightness(0.8),
+                ColorMatrix::contrast(0.5),
+                ColorMatrix::invert(0.25),
+            ])),
+        ];
+
+        for (chain_index, chain) in chains.iter().enumerate() {
+            assert!(chain.can_rewrite_paints_exactly());
+            for seed in 0..8 {
+                let source = randomized_scene(0x5eed_182 + seed);
+                let mut rewritten = source.clone();
+                chain.apply_to_scene(&mut rewritten);
+                let paint_pixels = render(rewritten);
+
+                let (image, _transform) = chain
+                    .rasterize_composited_scene(
+                        source,
+                        Rect::new(0.0, 0.0, f64::from(WIDTH), f64::from(HEIGHT)),
+                    )
+                    .expect("the fixed-size scene should rasterize");
+                // The scene starts with an opaque full-frame backdrop, so the
+                // offscreen result is already the group's final pixel value.
+                // Comparing it directly avoids adding an unrelated second
+                // image-sampling round trip to only one side of the proof.
+                let group_pixels = image.image.data.data();
+
+                for (byte, (paint, group)) in paint_pixels.iter().zip(group_pixels).enumerate() {
+                    assert!(
+                        paint.abs_diff(*group) <= 1,
+                        "chain {chain_index}, seed {seed}, byte {byte}: paint rewrite {paint}, group {group}"
+                    );
+                }
+            }
         }
     }
 
@@ -954,5 +1242,203 @@ mod tests {
         // Composed without the clamp would be 2·0.251 + 0.25 = 0.752 -> 192.
         let composed = ColorMatrix::linear_transfer(2.0, 0.25);
         assert_eq!(rgb(composed.apply(dark)), [192, 192, 192]);
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    #[test]
+    #[ignore = "manual 1280x720 group-filter stage profile"]
+    fn group_filter_stage_profile_1280x720() {
+        const WIDTH: u32 = 1280;
+        const HEIGHT: u32 = 720;
+        const WARMUPS: usize = 5;
+        const RUNS: usize = 30;
+
+        fn sample_stats(samples: &mut [f64]) -> (f64, f64, f64) {
+            samples.sort_by(f64::total_cmp);
+            (
+                samples[0],
+                samples[samples.len() / 2],
+                samples[samples.len() - 1],
+            )
+        }
+
+        fn milliseconds(duration: Duration) -> f64 {
+            duration.as_secs_f64() * 1000.0
+        }
+
+        fn full_screen_scene() -> Scene {
+            let mut scene = Scene::default();
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::new([0.82, 0.27, 0.51, 1.0]),
+                None,
+                &Rect::new(0.0, 0.0, f64::from(WIDTH), f64::from(HEIGHT)),
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::new([1.0, 1.0, 1.0, 0.35]),
+                None,
+                &Rect::new(0.0, 0.0, 900.0, 520.0),
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::new([0.08, 0.12, 0.24, 0.55]),
+                None,
+                &Circle::new((770.0, 360.0), 250.0),
+            );
+            scene
+        }
+
+        let chain = ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::hue_rotate(
+            92.0_f32.to_radians(),
+        )]));
+        assert!(!chain.can_rewrite_paints_exactly());
+        let bounds = Rect::new(0.0, 0.0, f64::from(WIDTH), f64::from(HEIGHT));
+        let source = full_screen_scene();
+        let mut outer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
+        let mut output = Vec::new();
+
+        let mut offscreen = Vec::with_capacity(RUNS);
+        let mut matrix = Vec::with_capacity(RUNS);
+        let mut composite = Vec::with_capacity(RUNS);
+        let mut total = Vec::with_capacity(RUNS);
+        for run in 0..WARMUPS + RUNS {
+            let total_start = Instant::now();
+            let (image, transform) = chain
+                .rasterize_composited_scene(source.clone(), bounds)
+                .expect("the full-screen scene should rasterize");
+            let profile = LAST_GROUP_FILTER_PROFILE.with(|profile| *profile.borrow());
+
+            outer.reset();
+            let composite_start = Instant::now();
+            outer.render_to_vec(
+                move |target| target.draw_image(image.as_ref(), transform),
+                &mut output,
+            );
+            let composite_elapsed = composite_start.elapsed();
+            let total_elapsed = total_start.elapsed();
+
+            if run >= WARMUPS {
+                offscreen.push(milliseconds(profile.offscreen_render));
+                matrix.push(milliseconds(profile.matrix_pass));
+                composite.push(milliseconds(composite_elapsed));
+                total.push(milliseconds(total_elapsed));
+            }
+        }
+
+        for (stage, samples) in [
+            ("offscreen_render", &mut offscreen),
+            ("matrix_pass", &mut matrix),
+            ("composite_back", &mut composite),
+            ("total", &mut total),
+        ] {
+            let (min, median, max) = sample_stats(samples);
+            println!(
+                "FILTER_PROFILE {stage} runs={RUNS} min_ms={min:.3} median_ms={median:.3} max_ms={max:.3}"
+            );
+        }
+
+        // Quantify the two pixel-loop decisions independently on a sparse
+        // full-screen buffer. Cloning is deliberately outside the timed span.
+        let mut sparse = Scene::default();
+        sparse.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::new([0.9, 0.2, 0.4, 0.7]),
+            None,
+            &Circle::new((320.0, 240.0), 180.0),
+        );
+        sparse.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::new([0.1, 0.8, 0.6, 0.6]),
+            None,
+            &Rect::new(540.0, 330.0, 940.0, 600.0),
+        );
+        let mut sparse_renderer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
+        let mut sparse_pixels = Vec::new();
+        sparse_renderer.render_to_vec(
+            move |target| target.append_scene(sparse, Affine::IDENTITY),
+            &mut sparse_pixels,
+        );
+        let transparent = sparse_pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[3] == 0)
+            .count();
+        println!(
+            "FILTER_PROFILE sparse_alpha_zero pixels={transparent}/{}",
+            sparse_pixels.len() / 4
+        );
+
+        fn apply_with_division(chain: &ColorMatrixChain, pixels: &mut [u8]) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                let alpha = f32::from(pixel[3]) / 255.0;
+                if alpha == 0.0 {
+                    continue;
+                }
+                let unpremultiply = 1.0 / (255.0 * alpha);
+                let filtered = chain.apply(Color::new([
+                    f32::from(pixel[0]) * unpremultiply,
+                    f32::from(pixel[1]) * unpremultiply,
+                    f32::from(pixel[2]) * unpremultiply,
+                    alpha,
+                ]));
+                for (channel, value) in pixel[..3].iter_mut().zip(&filtered.components[..3]) {
+                    *channel = (value * alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+
+        fn apply_without_alpha_zero_skip(chain: &ColorMatrixChain, pixels: &mut [u8]) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                let alpha_byte = usize::from(pixel[3]);
+                let alpha = alpha_byte as f32 / 255.0;
+                let unpremultiply = UNPREMULTIPLY_RGBA8[alpha_byte];
+                let filtered = chain.apply(Color::new([
+                    f32::from(pixel[0]) * unpremultiply,
+                    f32::from(pixel[1]) * unpremultiply,
+                    f32::from(pixel[2]) * unpremultiply,
+                    alpha,
+                ]));
+                for (channel, value) in pixel[..3].iter_mut().zip(&filtered.components[..3]) {
+                    *channel = (value * alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+
+        for (variant, apply) in [
+            (
+                "division_with_alpha_zero_skip",
+                apply_with_division as fn(&ColorMatrixChain, &mut [u8]),
+            ),
+            (
+                "reciprocal_without_alpha_zero_skip",
+                apply_without_alpha_zero_skip,
+            ),
+            (
+                "reciprocal_with_alpha_zero_skip",
+                ColorMatrixChain::apply_to_premultiplied_rgba8,
+            ),
+        ] {
+            let mut samples = Vec::with_capacity(RUNS);
+            for run in 0..WARMUPS + RUNS {
+                let mut pixels = sparse_pixels.clone();
+                let start = Instant::now();
+                apply(&chain, &mut pixels);
+                std::hint::black_box(&pixels);
+                if run >= WARMUPS {
+                    samples.push(milliseconds(start.elapsed()));
+                }
+            }
+            let (min, median, max) = sample_stats(&mut samples);
+            println!(
+                "FILTER_PROFILE {variant} runs={RUNS} min_ms={min:.3} median_ms={median:.3} max_ms={max:.3}"
+            );
+        }
     }
 }

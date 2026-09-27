@@ -331,8 +331,11 @@ fn a_blur_filter_does_not_panic() {
     assert_eq!(buf.len() as u32, W * H * 4);
 }
 
-/// Manual release-mode cost probe for the two representative filter shapes used
-/// to assess this implementation. This is ignored during the normal test suite.
+/// Manual release-mode cost probe for the actual filter exposure dimensions at
+/// 1280x720. The content is generic, but the filter chains and boxes match the
+/// product reference: whole-frame invert, one 48x48 icon, and 1218x200 photos.
+/// The full-screen hue rotation remains as a deliberately pessimistic control.
+/// This is ignored during the normal test suite.
 #[test]
 #[ignore = "manual 1280x720 frame-time benchmark"]
 fn filtered_subtree_frame_cost_1280x720() {
@@ -341,32 +344,59 @@ fn filtered_subtree_frame_cost_1280x720() {
     const WARMUPS: usize = 5;
     const RUNS: usize = 30;
 
-    let full_screen = r#"<main style="width:1280px; height:720px; filter:hue-rotate(92deg);
+    let full_screen_scene = |filter: &str| {
+        format!(
+            r#"<main style="width:1280px; height:720px; {filter}
         background:linear-gradient(135deg,#d04480,#40a0dc);">
         <div style="width:900px; height:520px; background:rgba(255,255,255,.35);"></div>
         <div style="width:700px; height:420px; margin:-360px 0 0 420px;
             border-radius:80px; background:rgba(20,30,60,.55);"></div>
+    </main>"#
+        )
+    };
+
+    let focused_icon = r##"<main style="width:1280px; height:720px; background:#246; padding:52px;">
+        <svg viewBox="0 0 48 48" style="width:48px; height:48px;
+            filter:brightness(.55) contrast(1.2)">
+            <rect x="2" y="8" width="44" height="34" rx="5" fill="#ef8a62"/>
+            <circle cx="17" cy="24" r="9" fill="#67a9cf" fill-opacity=".65"/>
+            <path d="M26 14 L42 36 L18 36 Z" fill="#f7f7f7"/>
+        </svg>
+    </main>"##;
+
+    let photo = |angle: u32| {
+        format!(
+            r#"<main style="width:1280px; height:720px; background:#ececec; padding:31px;">
+        <div style="box-sizing:border-box; width:1218px; height:200px;
+            filter:hue-rotate({angle}deg);
+            background:linear-gradient(135deg,#e56b8a,#f2c46d 45%,#54a7cb);">
+            <div style="width:760px; height:150px; border-radius:90px;
+                background:rgba(255,255,255,.38)"></div>
+            <div style="width:600px; height:100px; margin:-105px 0 0 560px;
+                background:rgba(12,42,74,.58)"></div>
+        </div>
+    </main>"#
+        )
+    };
+
+    let clipped = r#"<main style="width:1280px; height:720px; background:#246; padding:40px;">
+        <div style="width:320px; height:180px; overflow:hidden;">
+            <div style="width:1280px; height:720px; filter:hue-rotate(92deg);
+                background:linear-gradient(135deg,#d04480,#40a0dc)"></div>
+        </div>
     </main>"#;
 
-    let mut icon_grid = String::from(
-        r#"<main style="width:1280px; height:720px; background:#246; padding:32px;">"#,
-    );
-    for i in 0..48 {
-        let filter = if i % 4 == 0 {
-            "filter:brightness(.55) contrast(1.2);"
-        } else {
-            ""
-        };
-        icon_grid.push_str(&format!(
-            r#"<div style="display:inline-block; width:96px; height:96px; margin:12px;
-                border-radius:18px; background:linear-gradient(45deg,#e86,#68e);{filter}"></div>"#,
-        ));
-    }
-    icon_grid.push_str("</main>");
-
     for (name, body) in [
-        ("full_screen_hue_rotate", full_screen.to_owned()),
-        ("icon_grid_brightness_contrast", icon_grid),
+        ("full_screen_invert", full_screen_scene("filter:invert(1);")),
+        ("focused_icon_48x48", focused_icon.to_owned()),
+        ("photo_1218x200_hue_rotate_0", photo(0)),
+        ("photo_1218x200_hue_rotate_61", photo(61)),
+        ("photo_1218x200_hue_rotate_122", photo(122)),
+        (
+            "worst_case_full_screen_hue_rotate_92",
+            full_screen_scene("filter:hue-rotate(92deg);"),
+        ),
+        ("tuning_partially_clipped_hue_rotate", clipped.to_owned()),
     ] {
         let mut doc = document(&body, WIDTH, HEIGHT);
         let mut renderer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
@@ -391,9 +421,8 @@ fn filtered_subtree_frame_cost_1280x720() {
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         samples.sort_by(f64::total_cmp);
-        let mean = samples.iter().sum::<f64>() / RUNS as f64;
         println!(
-            "FILTER_BENCH {name} runs={RUNS} min_ms={:.3} median_ms={:.3} max_ms={:.3} mean_ms={mean:.3}",
+            "FILTER_BENCH {name} runs={RUNS} min_ms={:.3} median_ms={:.3} max_ms={:.3}",
             samples[0],
             samples[RUNS / 2],
             samples[RUNS - 1],
