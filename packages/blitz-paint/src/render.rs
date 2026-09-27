@@ -469,13 +469,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // Save it so that the mask can be drawn untransformed by scroll offsets.
                 let unscrolled_transform = cx.transform;
 
-                // Filter Effects 1 §13.1 expands seven of the ten shorthand
-                // filter functions to an alpha-preserving colour matrix. Those
-                // are applied by rewriting the colours of the recorded subtree
-                // (see `crate::color_matrix`), which is exactly equivalent to
-                // the §5 offscreen model for that subset and needs no render
-                // target. Anything else — `blur()`, `drop-shadow()`,
-                // `opacity()`, `url()` — stays on the `Filter` graph.
+                // Seven shorthand filter functions reduce to alpha-preserving
+                // colour matrices. The CPU path records and rasterises their
+                // subtree before applying the matrix to the composited pixels;
+                // anything spatial or alpha-changing stays on the Filter graph.
                 let color_matrix = ColorMatrixChain::from_filters(&effects.filter.0);
                 let filter = if color_matrix.is_some() {
                     None
@@ -498,14 +495,22 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .map(|f| f.expansion_rect())
                     .unwrap_or(Rect::ZERO);
 
-                let mut effect_layer_clip = cx.frame.border_box_path().bounding_box();
+                // Isolation is not itself an overflow clip. Use the subtree's
+                // layout overflow unless this element independently clips its
+                // contents; clip-path is applied by the outer layer above.
+                let border_box = cx.frame.border_box_path().bounding_box();
+                let mut effect_layer_clip = if should_clip {
+                    border_box
+                } else {
+                    overflow.union(border_box)
+                };
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
                 effect_layer_clip.y1 += filter_expansion_area.y1;
 
-                // Opacity/Filter layer if box has opacity or a filter.
-                // Clipped to border-box as it needs to include the background and borders.
+                // Opacity/backend-filter isolation. The clip is the independently
+                // clipped border box or the visible subtree overflow computed above.
                 self.layer_manager.maybe_with_layer(
                     scene,
                     has_opacity || filter.is_some() || backdrop_filter.is_some(),
@@ -515,11 +520,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     filter,
                     backdrop_filter,
                     |scene| match &color_matrix {
-                        // Filter Effects 1 §5: the element and its descendants
-                        // "are rendered together as a group with the filter
-                        // effect applied to the group as a whole". The recording
-                        // is that group's buffer; the chain filters it before it
-                        // is composited into the parent scene.
                         Some(chain) => {
                             let mut group = Scene::default();
                             cx.paint_effect_layer_contents(
@@ -530,8 +530,81 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 child_clip_rect,
                                 unscrolled_transform,
                             );
-                            chain.apply_to_scene(&mut group);
-                            scene.append_scene(group, Affine::IDENTITY);
+
+                            // If every intermediate maps the in-gamut RGB cube
+                            // back into itself, no clamp can fire and the affine
+                            // colour map commutes with source-over. Rewriting the
+                            // recorded paints is then exact and avoids a pixel
+                            // round trip through an offscreen buffer.
+                            if chain.can_rewrite_scene_exactly(&group) {
+                                chain.apply_to_scene(&mut group);
+                                scene.append_scene(group, Affine::IDENTITY);
+                                return;
+                            }
+
+                            #[cfg(feature = "vello-cpu-filters")]
+                            {
+                                // The offscreen adapter cannot represent
+                                // backend-owned paints, backdrop filters, or
+                                // complex filter graphs. Preserve their old
+                                // per-paint behaviour instead of silently
+                                // dropping part of the recorded scene.
+                                if !ColorMatrixChain::can_rasterize_scene_exactly(&group) {
+                                    chain.apply_to_scene(&mut group);
+                                    scene.append_scene(group, Affine::IDENTITY);
+                                    return;
+                                }
+                                let surface = Rect::from_origin_size(
+                                    (cx.initial_x, cx.initial_y),
+                                    (f64::from(cx.width), f64::from(cx.height)),
+                                );
+                                let layout_bounds =
+                                    cx.transform.transform_rect_bbox(overflow.union(border_box));
+                                let mut bounds =
+                                    ColorMatrixChain::recorded_visual_bounds(&group, layout_bounds);
+
+                                // Overflow and clip-path clip independently of
+                                // filtering. The offscreen buffer may include
+                                // visible descendant ink only when those rules
+                                // permit it.
+                                if should_clip {
+                                    bounds = bounds
+                                        .intersect(cx.transform.transform_rect_bbox(border_box));
+                                }
+                                if has_clip_path {
+                                    bounds =
+                                        bounds.intersect(cx.transform.transform_rect_bbox(
+                                            clip_path_for_layer.bounding_box(),
+                                        ));
+                                }
+
+                                bounds = bounds
+                                    .intersect(surface)
+                                    // `clip_rect` is in viewport coordinates;
+                                    // the recorded scene uses device coordinates
+                                    // including the paint call's initial offset.
+                                    .intersect(Rect::new(
+                                        clip_rect.x0 + cx.initial_x,
+                                        clip_rect.y0 + cx.initial_y,
+                                        clip_rect.x1 + cx.initial_x,
+                                        clip_rect.y1 + cx.initial_y,
+                                    ));
+                                match chain.rasterize_composited_scene(group, bounds) {
+                                    Ok((image, transform)) => {
+                                        scene.draw_image(image.as_ref(), transform);
+                                    }
+                                    Err(mut group) => {
+                                        chain.apply_to_scene(&mut group);
+                                        scene.append_scene(group, Affine::IDENTITY);
+                                    }
+                                }
+                            }
+
+                            #[cfg(not(feature = "vello-cpu-filters"))]
+                            {
+                                chain.apply_to_scene(&mut group);
+                                scene.append_scene(group, Affine::IDENTITY);
+                            }
                         }
                         None => cx.paint_effect_layer_contents(
                             scene,

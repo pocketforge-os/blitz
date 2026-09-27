@@ -1,47 +1,68 @@
-//! CSS `filter` colour-matrix shorthands, per Filter Effects 1.
+//! CSS `filter` colour-matrix shorthands.
 //!
 //! The expected values here are computed from the specification text, not from
-//! a previous render: §13.1 gives each shorthand's `<filter>` equivalent, §9.6
-//! and §9.7.1 give the arithmetic, and §5 fixes the colour space ("Filter
-//! Functions must operate in the sRGB color space") and the grouping ("All the
-//! elements descendants are rendered together as a group with the filter effect
-//! applied to the group as a whole").
+//! a previous render. The grouping requirement is: "All the elements descendants
+//! are rendered together as a group with the filter effect applied to the group
+//! as a whole." <https://drafts.csswg.org/filter-effects-1/#FilterProperty>
 //!
 //! The `wpt` runner cannot stand in for these: it compares a test render
 //! against a reference render made by the same engine, so a filter that is
 //! silently dropped from *both* still passes.
 
-use anyrender::render_to_buffer;
+use anyrender::{ImageRenderer, render_to_buffer};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_paint::paint_scene;
 use blitz_traits::shell::{ColorScheme, Viewport};
 use std::sync::Arc;
+use std::time::Instant;
 
 const W: u32 = 40;
 const H: u32 = 40;
 
 fn render(body: &str) -> Vec<u8> {
+    render_sized(body, W, H)
+}
+
+fn render_sized(body: &str, width: u32, height: u32) -> Vec<u8> {
     let html = format!(r#"<html><body style="margin:0; background:#ffffff;">{body}</body></html>"#);
     let mut doc = HtmlDocument::from_html(
         &html,
         DocumentConfig {
-            viewport: Some(Viewport::new(W, H, 1.0, ColorScheme::Light)),
+            viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
             html_parser_provider: Some(Arc::new(HtmlProvider) as _),
             ..Default::default()
         },
     );
     doc.resolve(0.0);
     render_to_buffer::<VelloCpuImageRenderer, _>(
-        |scene| paint_scene(scene, doc.as_mut(), 1.0, W, H, 0, 0),
-        W,
-        H,
+        |scene| paint_scene(scene, doc.as_mut(), 1.0, width, height, 0, 0),
+        width,
+        height,
     )
 }
 
+fn document(body: &str, width: u32, height: u32) -> HtmlDocument {
+    let html = format!(r#"<html><body style="margin:0; background:#fff;">{body}</body></html>"#);
+    let mut doc = HtmlDocument::from_html(
+        &html,
+        DocumentConfig {
+            viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
+            html_parser_provider: Some(Arc::new(HtmlProvider) as _),
+            ..Default::default()
+        },
+    );
+    doc.resolve(0.0);
+    doc
+}
+
 fn pixel(buf: &[u8], x: u32, y: u32) -> [u8; 3] {
-    let i = ((y * W + x) * 4) as usize;
+    pixel_in(buf, W, x, y)
+}
+
+fn pixel_in(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+    let i = ((y * width + x) * 4) as usize;
     [buf[i], buf[i + 1], buf[i + 2]]
 }
 
@@ -64,7 +85,7 @@ fn block(filter: &str, color: &str) -> String {
     format!(r#"<div style="width:40px; height:40px; background:{color}; {filter}"></div>"#)
 }
 
-/// §13.1.7: `brightness(a)` is `feFuncR/G/B type="linear" slope="a"`, i.e.
+/// `brightness(a)` is `feFuncR/G/B type="linear" slope="a"`, i.e.
 /// `C' = a * C` on non-premultiplied sRGB.
 #[test]
 fn brightness_scales_every_channel() {
@@ -73,7 +94,7 @@ fn brightness_scales_every_channel() {
     assert_close(centre(&buf), [64, 32, 96], "brightness(0.5)");
 }
 
-/// §13.1.8: `contrast(a)` is `type="linear" slope="a"
+/// `contrast(a)` is `type="linear" slope="a"
 /// intercept="-(0.5 * a) + 0.5"`. At `a = 0` every channel collapses onto 0.5.
 #[test]
 fn contrast_zero_is_mid_grey() {
@@ -81,14 +102,14 @@ fn contrast_zero_is_mid_grey() {
     assert_close(centre(&buf), [128, 128, 128], "contrast(0)");
 }
 
-/// §13.1.5: `invert(1)` is `type="table" tableValues="1 0"`, i.e. `C' = 1 - C`.
+/// `invert(1)` is `type="table" tableValues="1 0"`, i.e. `C' = 1 - C`.
 #[test]
 fn invert_one_complements_every_channel() {
     let buf = render(&block("filter: invert(1);", "#8040c0"));
     assert_close(centre(&buf), [127, 191, 63], "invert(1)");
 }
 
-/// §13.1.4/§9.6: `hue-rotate(0deg)` collapses the hueRotate matrix onto the
+/// `hue-rotate(0deg)` collapses the hueRotate matrix onto the
 /// identity (`cos 0 = 1`, `sin 0 = 0`). It must be byte-identical to no filter
 /// at all -- this is the control that separates "the filter ran and did
 /// nothing" from "the filter was dropped".
@@ -99,7 +120,7 @@ fn hue_rotate_zero_is_byte_identical_to_no_filter() {
     assert_eq!(filtered, plain, "hue-rotate(0deg) changed the frame");
 }
 
-/// §9.6 `type="hueRotate"` at 90 degrees: `cos = 0`, `sin = 1`, so the matrix
+/// `type="hueRotate"` at 90 degrees: `cos = 0`, `sin = 1`, so the matrix
 /// is the constant term plus the sin term, e.g. the red row becomes
 /// `(0.213 - 0.213, 0.715 - 0.715, 0.072 + 0.928) = (0, 0, 1)`.
 #[test]
@@ -121,9 +142,8 @@ fn hue_rotate_ninety_matches_the_spec_matrix() {
     assert_close(centre(&buf), want, "hue-rotate(90deg)");
 }
 
-/// §5: "The list of functions are applied in the order provided", and §9.7.1
-/// puts `C` and `C'` "both in the closed interval [0,1]", so the chain clamps
-/// between functions. `brightness(4)` saturates a mid grey to white before
+/// The chain applies functions in author order and clamps to `[0,1]` between
+/// them. `brightness(4)` saturates a mid grey to white before
 /// `contrast(0.5)` maps it to 0.75 -- a single composed matrix without the
 /// intermediate clamp would give 0.752.
 #[test]
@@ -132,8 +152,8 @@ fn a_chain_applies_in_order_with_clamping_between() {
     assert_close(centre(&buf), [191, 191, 191], "brightness(4) contrast(0.5)");
 }
 
-/// The design-authority declaration from PocketForge's Poolsuite app,
-/// `filter: brightness(.55) contrast(1.2)` on a selected desktop icon.
+/// A representative `filter: brightness(.55) contrast(1.2)` on a selected
+/// desktop icon.
 /// (128, 64, 192) -> x0.55 -> (70.4, 35.2, 105.6) -> x1.2 - 0.1*255 ->
 /// (58.98, 16.74, 101.22).
 #[test]
@@ -147,8 +167,8 @@ fn brightness_then_contrast_darkens_a_selected_icon() {
     assert_close(centre(&buf), want, "brightness(.55) contrast(1.2)");
 }
 
-/// §5: the filter applies to the element "and its descendants [...] as a
-/// group". A child painted inside a filtered ancestor must be filtered even
+/// A filter applies to the element and its descendants as one group. A child
+/// painted inside a filtered ancestor must be filtered even
 /// though the child carries no `filter` of its own.
 #[test]
 fn the_filter_covers_descendants() {
@@ -159,8 +179,127 @@ fn the_filter_covers_descendants() {
     assert_close(centre(&buf), [127, 191, 63], "invert(1) on a descendant");
 }
 
+/// The outer colour matrix applies after a descendant's spatial filter. The
+/// shadow starts red and therefore must be cyan after the ancestor's invert;
+/// the white group backdrop makes a silently dropped shadow visible too.
+#[test]
+fn ancestor_invert_preserves_and_filters_a_descendant_drop_shadow() {
+    let body = r#"<div style="position:relative; width:40px; height:40px;
+            background:#000; filter:invert(1)">
+        <div style="position:absolute; left:4px; top:4px; width:8px; height:8px;
+            background:#000; filter:drop-shadow(12px 0 0 #ff0000)"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 20, 8),
+        [0, 255, 255],
+        "descendant drop shadow after ancestor invert(1)",
+    );
+}
+
+/// The portion of a source beyond the surface can still cast a blurred shadow
+/// into the visible output. The larger render is the unclipped reference;
+/// cropping its left 40 pixels must equal the direct 40-pixel surface render.
+#[test]
+fn nested_drop_shadow_reads_source_beyond_the_surface_edge() {
+    let body = r#"<div style="position:relative; width:80px; height:40px;
+            background:#000; filter:invert(1)">
+        <div style="position:absolute; left:38px; top:14px; width:8px; height:12px;
+            background:#000; filter:drop-shadow(-5px 0 3px #ff0000)"></div>
+    </div>"#;
+    let clipped = render_sized(body, 40, 40);
+    let reference = render_sized(body, 80, 40);
+
+    assert_ne!(
+        pixel_in(&reference, 80, 34, 20),
+        [255, 255, 255],
+        "reference edge pixel must contain the inverted shadow"
+    );
+    for x in [34, 36, 38, 39] {
+        assert_close(
+            pixel_in(&clipped, 40, x, 20),
+            pixel_in(&reference, 80, x, 20),
+            "drop shadow just inside the surface edge",
+        );
+    }
+}
+
+/// An ancestor overflow clip applies after the descendant blur. Pixels outside
+/// the clip still contribute to blur samples just inside it. Expanding the
+/// reference clip exposes those source pixels, after which cropping at x=40
+/// must reproduce the clipped scene's inside-edge pixels.
+#[test]
+fn nested_blur_reads_source_beyond_an_ancestor_clip_edge() {
+    let scene = |clip_width: u32| {
+        format!(
+            r#"<div style="width:{clip_width}px; height:40px; overflow:hidden">
+                <div style="position:relative; width:80px; height:40px;
+                        background:#000; filter:invert(1)">
+                    <div style="position:absolute; left:38px; top:14px;
+                        width:8px; height:12px; background:#ff0000;
+                        filter:blur(3px)"></div>
+                </div>
+            </div>"#
+        )
+    };
+    let clipped = render_sized(&scene(40), 80, 40);
+    let reference = render_sized(&scene(80), 80, 40);
+
+    assert_ne!(
+        pixel_in(&reference, 80, 38, 20),
+        [255, 255, 255],
+        "reference edge pixel must contain the inverted blur"
+    );
+    for x in [35, 37, 38, 39] {
+        assert_close(
+            pixel_in(&clipped, 80, x, 20),
+            pixel_in(&reference, 80, x, 20),
+            "blur just inside the ancestor clip edge",
+        );
+    }
+}
+
+/// This is the real nested colour-filter shape: a clamp-capable descendant
+/// chain inside a clamp-free ancestor. The inner chain runs and clamps first;
+/// only then does the ancestor invert its completed result.
+#[test]
+fn ancestor_invert_follows_a_descendant_brightness_contrast_group() {
+    let body = r#"<div style="width:40px; height:40px; filter:invert(1)">
+        <div style="width:40px; height:40px; background:#8040c0;
+            filter:brightness(.55) contrast(1.2)"></div>
+    </div>"#;
+    let buf = render(body);
+    let want: [u8; 3] = std::array::from_fn(|i| {
+        let c = [128.0_f32, 64.0, 192.0][i] / 255.0;
+        let inner = (1.2 * (0.55 * c).clamp(0.0, 1.0) - 0.1).clamp(0.0, 1.0);
+        ((1.0 - inner) * 255.0 + 0.5) as u8
+    });
+    assert_close(
+        centre(&buf),
+        want,
+        "descendant brightness/contrast group before ancestor invert(1)",
+    );
+}
+
+/// CSS box shadows are recorded as paint commands rather than filter graphs,
+/// but they are still descendant ink and must be transformed by the ancestor.
+#[test]
+fn ancestor_invert_filters_a_descendant_box_shadow() {
+    let body = r#"<div style="position:relative; width:40px; height:40px;
+            background:#000; filter:invert(1)">
+        <div style="position:absolute; left:4px; top:4px; width:8px; height:8px;
+            box-shadow:12px 0 0 #ff0000"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 20, 8),
+        [0, 255, 255],
+        "descendant box shadow after ancestor invert(1)",
+    );
+}
+
 /// A translucent child over an opaque background inside the filtered group.
-/// §5 composites the group first and filters the result, so the expected value
+/// The group composites first and filters the result, so the expected value
 /// is `f(0.5 * blue + 0.5 * white)`, not `f(blue)` alone. `contrast(0.5)`
 /// carries a non-zero intercept, which is the term a per-paint rewrite has to
 /// get right for this to agree.
@@ -182,8 +321,121 @@ fn a_translucent_overlap_matches_the_filtered_composite() {
     );
 }
 
-/// §5: "first any filter effect is applied, then any clipping, masking and
-/// opacity". Element opacity multiplies the already-filtered group, so a black
+/// The filter sees the composited group, so the half-transparent white child first
+/// produces mid-grey over black and `brightness(2)` then clamps that result to white.
+#[test]
+fn brightness_clamps_after_a_translucent_child_is_composited() {
+    let body = r#"<div style="width:40px; height:40px; background:#000; filter:brightness(2);">
+        <div style="width:40px; height:40px; background:rgba(255,255,255,0.5);"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        centre(&buf),
+        [255, 255, 255],
+        "brightness(2) after translucent compositing",
+    );
+}
+
+/// Antialiasing is partial coverage and therefore another translucent composite.
+/// Find a non-trivial edge texel in an unfiltered reference and verify that the
+/// filtered group doubles that composited value, rather than filtering opaque white
+/// before its coverage is applied.
+#[test]
+fn brightness_filters_an_antialiased_edge_after_coverage() {
+    let plain = render(
+        r#"<div style="width:40px; height:40px; background:#000;">
+            <div style="width:24px; height:24px; border-radius:50%; background:#fff;"></div>
+        </div>"#,
+    );
+    let filtered = render(
+        r#"<div style="width:40px; height:40px; background:#000; filter:brightness(2);">
+            <div style="width:24px; height:24px; border-radius:50%; background:#fff;"></div>
+        </div>"#,
+    );
+
+    let (index, source) = plain
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .find(|(_, px)| px[0] >= 32 && px[0] <= 160 && px[0] == px[1] && px[1] == px[2])
+        .map(|(index, px)| (index, px[0]))
+        .expect("the rounded edge should contain a partially covered texel");
+    let got = filtered.as_chunks::<4>().0[index][0];
+    let want = source.saturating_mul(2);
+    assert!(
+        got.abs_diff(want) <= 2,
+        "antialiased edge: source coverage {source}, got {got}, expected {want} (+/-2)"
+    );
+}
+
+/// `contrast(2)` maps values below 0.25 below zero. The translucent white child
+/// composites to 0.2 over black, so filtering the group clamps it to black.
+#[test]
+fn contrast_clamps_below_zero_after_translucent_compositing() {
+    let body = r#"<div style="width:40px; height:40px; background:#000; filter:contrast(2);">
+        <div style="width:40px; height:40px; background:rgba(255,255,255,0.2);"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        centre(&buf),
+        [0, 0, 0],
+        "contrast(2) below-zero clamp after translucent compositing",
+    );
+}
+
+/// A filter establishes a group, not an overflow clip. Descendant ink outside
+/// the filtered element's border box remains visible when overflow is visible,
+/// and the ancestor filter applies to that ink.
+#[test]
+fn a_group_filter_preserves_visible_descendant_overflow() {
+    let body = r#"<div style="position:relative; width:10px; height:10px;
+            overflow:visible; filter:brightness(2)">
+        <div style="position:absolute; left:20px; top:0; width:10px; height:10px;
+            background:#404040"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 25, 5),
+        [128, 128, 128],
+        "filtered descendant outside a visible-overflow border box",
+    );
+}
+
+/// Descendant ink overflow includes effects that layout overflow alone does not
+/// know about. The outer filter must retain and transform that effect too.
+#[test]
+fn a_group_filter_bounds_visible_descendant_effect_overflow() {
+    let body = r#"<div style="position:relative; width:5px; height:5px;
+            overflow:visible; filter:brightness(2)">
+        <div style="position:absolute; left:10px; top:0; width:5px; height:5px;
+            box-shadow:10px 0 0 #404040"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 22, 2),
+        [128, 128, 128],
+        "filtered descendant effect outside layout overflow",
+    );
+}
+
+/// The same geometry remains clipped when overflow independently requires it.
+#[test]
+fn a_group_filter_keeps_hidden_descendant_overflow_clipped() {
+    let body = r#"<div style="position:relative; width:10px; height:10px;
+            overflow:hidden; filter:brightness(2)">
+        <div style="position:absolute; left:20px; top:0; width:10px; height:10px;
+            background:#404040"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 25, 5),
+        [255, 255, 255],
+        "hidden overflow outside a filtered border box",
+    );
+}
+
+/// Element opacity multiplies the already-filtered group, so a black
 /// result at 50% over white is mid grey either way -- but an implementation
 /// that filtered *after* opacity would lift the black towards the backdrop
 /// before inverting it.
@@ -193,7 +445,7 @@ fn opacity_is_applied_after_the_filter() {
     assert_close(centre(&buf), [128, 128, 128], "invert(1) under opacity 0.5");
 }
 
-/// A gradient is one paint but many pixel colours, and §9.7.1's `[0,1]` clamp
+/// A gradient is one paint but many pixel colours, and the `[0,1]` clamp
 /// is applied per pixel, after the ramp is interpolated. Filtering only the
 /// authored stops and letting the renderer interpolate between already-clamped
 /// results is a different function, because clamping does not commute with
@@ -255,4 +507,120 @@ fn a_clamping_gradient_is_filtered_per_pixel_not_per_stop() {
 fn a_blur_filter_does_not_panic() {
     let buf = render(&block("filter: blur(2px);", "#8040c0"));
     assert_eq!(buf.len() as u32, W * H * 4);
+}
+
+/// Manual release-mode cost probe for the actual filter exposure dimensions at
+/// 1280x720. The content is generic, but the filter chains and boxes match the
+/// product reference: whole-frame invert, one 48x48 icon, and 1218x200 photos.
+/// The full-screen hue rotation remains as a deliberately pessimistic control.
+/// This is ignored during the normal test suite.
+#[test]
+#[ignore = "manual 1280x720 frame-time benchmark"]
+fn filtered_subtree_frame_cost_1280x720() {
+    const WIDTH: u32 = 1280;
+    const HEIGHT: u32 = 720;
+    const WARMUPS: usize = 5;
+    const RUNS: usize = 30;
+
+    let full_screen_scene = |filter: &str| {
+        format!(
+            r#"<main style="width:1280px; height:720px; {filter}
+        background:linear-gradient(135deg,#d04480,#40a0dc);">
+        <div style="width:900px; height:520px; background:rgba(255,255,255,.35);"></div>
+        <div style="width:700px; height:420px; margin:-360px 0 0 420px;
+            border-radius:80px; background:rgba(20,30,60,.55);"></div>
+    </main>"#
+        )
+    };
+
+    let focused_icon = r##"<main style="width:1280px; height:720px; background:#246; padding:52px;">
+        <svg viewBox="0 0 48 48" style="width:48px; height:48px;
+            filter:brightness(.55) contrast(1.2)">
+            <rect x="2" y="8" width="44" height="34" rx="5" fill="#ef8a62"/>
+            <circle cx="17" cy="24" r="9" fill="#67a9cf" fill-opacity=".65"/>
+            <path d="M26 14 L42 36 L18 36 Z" fill="#f7f7f7"/>
+        </svg>
+    </main>"##;
+
+    let inverted_desktop_with_nested_effects = r##"<main style="width:1280px; height:720px;
+            background:#246; padding:52px; filter:invert(1)">
+        <section style="width:900px; height:520px; background:#ddd;
+            box-shadow:12px 14px 20px rgba(0,0,0,.65)">
+            <svg viewBox="0 0 48 48" style="width:48px; height:48px;
+                filter:brightness(.55) contrast(1.2)">
+                <rect x="2" y="8" width="44" height="34" rx="5" fill="#ef8a62"/>
+                <circle cx="17" cy="24" r="9" fill="#67a9cf" fill-opacity=".65"/>
+                <path d="M26 14 L42 36 L18 36 Z" fill="#f7f7f7"/>
+            </svg>
+        </section>
+    </main>"##;
+
+    let photo = |angle: u32| {
+        format!(
+            r#"<main style="width:1280px; height:720px; background:#ececec; padding:31px;">
+        <div style="box-sizing:border-box; width:1218px; height:200px;
+            filter:hue-rotate({angle}deg);
+            background:linear-gradient(135deg,#e56b8a,#f2c46d 45%,#54a7cb);">
+            <div style="width:760px; height:150px; border-radius:90px;
+                background:rgba(255,255,255,.38)"></div>
+            <div style="width:600px; height:100px; margin:-105px 0 0 560px;
+                background:rgba(12,42,74,.58)"></div>
+        </div>
+    </main>"#
+        )
+    };
+
+    let clipped = r#"<main style="width:1280px; height:720px; background:#246; padding:40px;">
+        <div style="width:320px; height:180px; overflow:hidden;">
+            <div style="width:1280px; height:720px; filter:hue-rotate(92deg);
+                background:linear-gradient(135deg,#d04480,#40a0dc)"></div>
+        </div>
+    </main>"#;
+
+    for (name, body) in [
+        ("full_screen_invert", full_screen_scene("filter:invert(1);")),
+        ("focused_icon_48x48", focused_icon.to_owned()),
+        (
+            "full_screen_invert_with_nested_icon_and_box_shadow",
+            inverted_desktop_with_nested_effects.to_owned(),
+        ),
+        ("photo_1218x200_hue_rotate_0", photo(0)),
+        ("photo_1218x200_hue_rotate_61", photo(61)),
+        ("photo_1218x200_hue_rotate_122", photo(122)),
+        (
+            "worst_case_full_screen_hue_rotate_92",
+            full_screen_scene("filter:hue-rotate(92deg);"),
+        ),
+        ("tuning_partially_clipped_hue_rotate", clipped.to_owned()),
+    ] {
+        let mut doc = document(&body, WIDTH, HEIGHT);
+        let mut renderer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
+        let mut buffer = Vec::new();
+
+        for _ in 0..WARMUPS {
+            renderer.reset();
+            renderer.render_to_vec(
+                |scene| paint_scene(scene, doc.as_mut(), 1.0, WIDTH, HEIGHT, 0, 0),
+                &mut buffer,
+            );
+        }
+
+        let mut samples = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            renderer.reset();
+            let start = Instant::now();
+            renderer.render_to_vec(
+                |scene| paint_scene(scene, doc.as_mut(), 1.0, WIDTH, HEIGHT, 0, 0),
+                &mut buffer,
+            );
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "FILTER_BENCH {name} runs={RUNS} min_ms={:.3} median_ms={:.3} max_ms={:.3}",
+            samples[0],
+            samples[RUNS / 2],
+            samples[RUNS - 1],
+        );
+    }
 }
