@@ -171,6 +171,63 @@ fn the_filter_covers_descendants() {
     assert_close(centre(&buf), [127, 191, 63], "invert(1) on a descendant");
 }
 
+/// The outer colour matrix applies after a descendant's spatial filter. The
+/// shadow starts red and therefore must be cyan after the ancestor's invert;
+/// the white group backdrop makes a silently dropped shadow visible too.
+#[test]
+fn ancestor_invert_preserves_and_filters_a_descendant_drop_shadow() {
+    let body = r#"<div style="position:relative; width:40px; height:40px;
+            background:#000; filter:invert(1)">
+        <div style="position:absolute; left:4px; top:4px; width:8px; height:8px;
+            background:#000; filter:drop-shadow(12px 0 0 #ff0000)"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 20, 8),
+        [0, 255, 255],
+        "descendant drop shadow after ancestor invert(1)",
+    );
+}
+
+/// This is the real nested colour-filter shape: a clamp-capable descendant
+/// chain inside a clamp-free ancestor. The inner chain runs and clamps first;
+/// only then does the ancestor invert its completed result.
+#[test]
+fn ancestor_invert_follows_a_descendant_brightness_contrast_group() {
+    let body = r#"<div style="width:40px; height:40px; filter:invert(1)">
+        <div style="width:40px; height:40px; background:#8040c0;
+            filter:brightness(.55) contrast(1.2)"></div>
+    </div>"#;
+    let buf = render(body);
+    let want: [u8; 3] = std::array::from_fn(|i| {
+        let c = [128.0_f32, 64.0, 192.0][i] / 255.0;
+        let inner = (1.2 * (0.55 * c).clamp(0.0, 1.0) - 0.1).clamp(0.0, 1.0);
+        ((1.0 - inner) * 255.0 + 0.5) as u8
+    });
+    assert_close(
+        centre(&buf),
+        want,
+        "descendant brightness/contrast group before ancestor invert(1)",
+    );
+}
+
+/// CSS box shadows are recorded as paint commands rather than filter graphs,
+/// but they are still descendant ink and must be transformed by the ancestor.
+#[test]
+fn ancestor_invert_filters_a_descendant_box_shadow() {
+    let body = r#"<div style="position:relative; width:40px; height:40px;
+            background:#000; filter:invert(1)">
+        <div style="position:absolute; left:4px; top:4px; width:8px; height:8px;
+            box-shadow:12px 0 0 #ff0000"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 20, 8),
+        [0, 255, 255],
+        "descendant box shadow after ancestor invert(1)",
+    );
+}
+
 /// A translucent child over an opaque background inside the filtered group.
 /// The group composites first and filters the result, so the expected value
 /// is `f(0.5 * blue + 0.5 * white)`, not `f(blue)` alone. `contrast(0.5)`
@@ -415,6 +472,19 @@ fn filtered_subtree_frame_cost_1280x720() {
         </svg>
     </main>"##;
 
+    let inverted_desktop_with_nested_effects = r##"<main style="width:1280px; height:720px;
+            background:#246; padding:52px; filter:invert(1)">
+        <section style="width:900px; height:520px; background:#ddd;
+            box-shadow:12px 14px 20px rgba(0,0,0,.65)">
+            <svg viewBox="0 0 48 48" style="width:48px; height:48px;
+                filter:brightness(.55) contrast(1.2)">
+                <rect x="2" y="8" width="44" height="34" rx="5" fill="#ef8a62"/>
+                <circle cx="17" cy="24" r="9" fill="#67a9cf" fill-opacity=".65"/>
+                <path d="M26 14 L42 36 L18 36 Z" fill="#f7f7f7"/>
+            </svg>
+        </section>
+    </main>"##;
+
     let photo = |angle: u32| {
         format!(
             r#"<main style="width:1280px; height:720px; background:#ececec; padding:31px;">
@@ -440,6 +510,10 @@ fn filtered_subtree_frame_cost_1280x720() {
     for (name, body) in [
         ("full_screen_invert", full_screen_scene("filter:invert(1);")),
         ("focused_icon_48x48", focused_icon.to_owned()),
+        (
+            "full_screen_invert_with_nested_icon_and_box_shadow",
+            inverted_desktop_with_nested_effects.to_owned(),
+        ),
         ("photo_1218x200_hue_rotate_0", photo(0)),
         ("photo_1218x200_hue_rotate_61", photo(61)),
         ("photo_1218x200_hue_rotate_122", photo(122)),

@@ -544,6 +544,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
                             #[cfg(feature = "vello-cpu-filters")]
                             {
+                                // The offscreen adapter cannot represent
+                                // backend-owned paints, backdrop filters, or
+                                // complex filter graphs. Preserve their old
+                                // per-paint behaviour instead of silently
+                                // dropping part of the recorded scene.
+                                if !ColorMatrixChain::can_rasterize_scene_exactly(&group) {
+                                    chain.apply_to_scene(&mut group);
+                                    scene.append_scene(group, Affine::IDENTITY);
+                                    return;
+                                }
                                 let surface = Rect::from_origin_size(
                                     (cx.initial_x, cx.initial_y),
                                     (f64::from(cx.width), f64::from(cx.height)),

@@ -11,7 +11,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["svg"]
+default = ["svg", "vello-cpu-filters"]
 tracing = ["dep:tracing"]
 svg = ["dep:anyrender_svg", "dep:usvg", "blitz-dom/svg"]
 custom-widget = ["blitz-dom/custom-widget"]
@@ -22,14 +22,18 @@ apple-font-embolden = []
 # matures).
 scrollbars = ["blitz-dom/scrollbars"]
 # Rasterise a filtered subtree with the pinned Vello CPU backend, then apply the
-# colour matrix to the composited pixels. This is enabled by CPU renderer users.
-vello-cpu-filters = ["dep:anyrender_vello_cpu"]
+# colour matrix to the composited pixels. It is a default so consumers do not
+# silently get the older per-paint approximation; `default-features = false`
+# users must opt in explicitly.
+vello-cpu-filters = ["dep:anyrender_vello_cpu", "dep:vello_common", "dep:vello_cpu"]
 
 [dependencies]
 # Blitz dependencies
 anyrender = { workspace = true }
 anyrender_svg = { workspace = true, optional = true }
 anyrender_vello_cpu = { workspace = true, optional = true }
+vello_common = { version = "0.1", optional = true }
+vello_cpu = { version = "0.1", optional = true }
 blitz-traits = { workspace = true }
 blitz-dom = { workspace = true }
 

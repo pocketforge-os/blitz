@@ -16,10 +16,10 @@ blitz-test-harness = { workspace = true }
 blitz-dom = { workspace = true, features = ["accessibility", "floats", "system-fonts"] }
 blitz-html = { workspace = true }
 blitz-traits = { workspace = true }
-blitz-paint = { workspace = true, features = ["scrollbars", "svg", "vello-cpu-filters"] }
+blitz-paint = { workspace = true, default-features = false, features = ["scrollbars", "svg", "vello-cpu-filters"] }
 dioxus-native-dom = { workspace = true }
 anyrender = { workspace = true }
-anyrender_vello_cpu = { workspace = true }
+anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
 kurbo = { workspace = true }
 
 # DioxusLabs dependencies

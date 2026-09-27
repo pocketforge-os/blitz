@@ -59,10 +59,17 @@
 //! The pinned Vello CPU renderer does not execute colour-matrix primitives and
 //! its multithreaded dispatcher rejects every filter layer, so `blitz-paint`
 //! supplies the offscreen pass and reuses one renderer's scratch allocations.
-//! Builds without that feature retain the older per-paint rewrite as a
-//! compatibility fallback for backends without an offscreen seam.
+//! Supported single-node descendant filters are resolved with Vello CPU's
+//! runtime single-thread dispatcher before the enclosing multithreaded pass.
+//! Unsupported complex graphs, backdrop filters, and backend-owned paints keep
+//! the older per-paint behaviour rather than being partially rendered. Builds
+//! without `vello-cpu-filters` also retain that compatibility fallback.
 
+#[cfg(feature = "vello-cpu-filters")]
+use anyrender::Filter;
 use anyrender::Paint;
+#[cfg(feature = "vello-cpu-filters")]
+use anyrender::filters::{EdgeMode, FilterEffect};
 use anyrender::recording::{RenderCommand, Scene};
 #[cfg(feature = "vello-cpu-filters")]
 use anyrender::{ImageRenderer as _, PaintScene as _};
@@ -85,6 +92,13 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 #[cfg(all(test, feature = "vello-cpu-filters"))]
 use std::time::{Duration, Instant};
+#[cfg(feature = "vello-cpu-filters")]
+use vello_common::filter_effects::{Filter as VelloFilter, FilterPrimitive};
+#[cfg(feature = "vello-cpu-filters")]
+use vello_cpu::{
+    Image as VelloImage, ImageSource, PaintType, PixmapMut, RenderContext as VelloRenderContext,
+    RenderSettings, Resources,
+};
 
 use crate::color::Color;
 use crate::filters::StyloFilter;
@@ -112,6 +126,64 @@ thread_local! {
     /// framebuffer for every distinct animated element size ever observed.
     static FILTER_RENDERER: RefCell<Option<(u32, u32, VelloCpuImageRenderer)>> =
         const { RefCell::new(None) };
+}
+
+/// Convert the subset of AnyRender filter graphs that the pinned Vello CPU
+/// single-thread dispatcher executes exactly. Complex graphs are deliberately
+/// rejected: the renderer supports one primitive, and accepting only its first
+/// node would silently discard the rest.
+#[cfg(feature = "vello-cpu-filters")]
+fn convert_single_node_filter(filter: &Filter) -> Option<VelloFilter> {
+    let [node] = filter.nodes() else {
+        return None;
+    };
+    if node.inputs != anyrender::filters::FilterInputs::NONE {
+        return None;
+    }
+    let primitive = match &node.effect {
+        FilterEffect::Flood(color) => FilterPrimitive::Flood { color: *color },
+        FilterEffect::GaussianBlur(blur) => FilterPrimitive::GaussianBlur {
+            std_deviation: blur.std_deviation,
+            edge_mode: convert_edge_mode(blur.edge_mode),
+        },
+        FilterEffect::DropShadow(shadow) => FilterPrimitive::DropShadow {
+            dx: shadow.dx,
+            dy: shadow.dy,
+            std_deviation: shadow.std_deviation,
+            color: shadow.color,
+            edge_mode: convert_edge_mode(shadow.edge_mode),
+        },
+        FilterEffect::Offset(offset) => FilterPrimitive::Offset {
+            dx: offset.x as f32,
+            dy: offset.y as f32,
+        },
+        // These variants exist in Vello's public graph type but its pinned
+        // `PreparedFilter` rejects them at runtime. Do not advertise them as
+        // accepted merely because they can be converted structurally.
+        FilterEffect::ColorMatrix(_)
+        | FilterEffect::Blend(_)
+        | FilterEffect::ComponentTransfer(_)
+        | FilterEffect::Composite(_)
+        | FilterEffect::Morphology(_)
+        | FilterEffect::ConvolveMatrix(_)
+        | FilterEffect::Turbulence(_)
+        | FilterEffect::DisplacementMap(_)
+        | FilterEffect::Image(_)
+        | FilterEffect::Tile
+        | FilterEffect::DiffuseLighting(_)
+        | FilterEffect::SpecularLighting(_) => return None,
+    };
+    Some(VelloFilter::from_primitive(primitive))
+}
+
+#[cfg(feature = "vello-cpu-filters")]
+fn convert_edge_mode(edge_mode: EdgeMode) -> vello_common::filter_effects::EdgeMode {
+    match edge_mode {
+        EdgeMode::Duplicate => vello_common::filter_effects::EdgeMode::Duplicate,
+        EdgeMode::Wrap => vello_common::filter_effects::EdgeMode::Wrap,
+        EdgeMode::Mirror => vello_common::filter_effects::EdgeMode::Mirror,
+        EdgeMode::None => vello_common::filter_effects::EdgeMode::None,
+    }
 }
 
 #[cfg(all(test, feature = "vello-cpu-filters"))]
@@ -448,6 +520,71 @@ impl ColorMatrixChain {
         }
     }
 
+    /// Whether the pinned offscreen renderer can preserve every recorded
+    /// operation. Supported single-node filter layers are resolved through a
+    /// runtime single-thread Vello pass before the scene reaches the compiled
+    /// multithreaded AnyRender adapter. Everything else keeps the pre-group
+    /// paint-rewrite behaviour instead of being partially rendered.
+    #[cfg(feature = "vello-cpu-filters")]
+    pub(crate) fn can_rasterize_scene_exactly(scene: &Scene) -> bool {
+        let mut depth = 0_usize;
+        for command in &scene.commands {
+            match command {
+                RenderCommand::Fill(command) => {
+                    if !Self::can_rasterize_paint_exactly(&command.brush) {
+                        return false;
+                    }
+                }
+                RenderCommand::Stroke(command) => {
+                    if !Self::can_rasterize_paint_exactly(&command.brush) {
+                        return false;
+                    }
+                }
+                RenderCommand::GlyphRun(command) => {
+                    if !Self::can_rasterize_paint_exactly(&command.brush) {
+                        return false;
+                    }
+                }
+                RenderCommand::BoxShadow(_) => {}
+                RenderCommand::PushLayer(command) => {
+                    if command.backdrop_filter.is_some()
+                        || command
+                            .filter
+                            .as_deref()
+                            .is_some_and(|filter| convert_single_node_filter(filter).is_none())
+                    {
+                        return false;
+                    }
+                    depth += 1;
+                }
+                RenderCommand::PushClipLayer(_) => depth += 1,
+                RenderCommand::PopLayer => {
+                    let Some(next_depth) = depth.checked_sub(1) else {
+                        return false;
+                    };
+                    depth = next_depth;
+                }
+            }
+        }
+        depth == 0
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    fn can_rasterize_paint_exactly(paint: &Paint) -> bool {
+        match paint {
+            Paint::Solid(_) | Paint::Gradient(_) => true,
+            Paint::Image(brush) => {
+                matches!(brush.image.format, ImageFormat::Rgba8 | ImageFormat::Bgra8)
+                    && brush
+                        .image
+                        .format
+                        .size_in_bytes(brush.image.width, brush.image.height)
+                        .is_some_and(|size| size == brush.image.data.data().len())
+            }
+            Paint::Resource(_) | Paint::Custom(_) => false,
+        }
+    }
+
     /// Conservative device-space ink bounds for a recorded filtered subtree.
     ///
     /// `layout_bounds` supplies descendant geometry (including glyph layout).
@@ -520,6 +657,209 @@ impl ColorMatrixChain {
             })
     }
 
+    /// Replace supported nested filter layers with already-filtered images.
+    ///
+    /// `anyrender_vello_cpu` decides whether to keep a layer filter at compile
+    /// time and drops all of them when `multithreading` is enabled. Resolving
+    /// each accepted layer here lets the application renderer remain
+    /// multithreaded while the small filter-only pass selects Vello CPU's
+    /// runtime single-thread dispatcher.
+    #[cfg(feature = "vello-cpu-filters")]
+    fn resolve_nested_filter_layers(scene: Scene, visible_bounds: Rect) -> Scene {
+        let tolerance = scene.tolerance;
+        let mut commands = scene.commands.into_iter();
+        let resolved = Self::resolve_command_range(&mut commands, tolerance, visible_bounds, false)
+            .expect("scene raster eligibility validated balanced layer commands");
+        debug_assert!(commands.next().is_none());
+        Scene {
+            tolerance,
+            commands: resolved,
+        }
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    fn resolve_command_range(
+        commands: &mut std::vec::IntoIter<RenderCommand>,
+        tolerance: f64,
+        visible_bounds: Rect,
+        stop_at_pop: bool,
+    ) -> Option<Vec<RenderCommand>> {
+        let mut resolved = Vec::new();
+        while let Some(command) = commands.next() {
+            match command {
+                RenderCommand::PopLayer => {
+                    return stop_at_pop.then_some(resolved);
+                }
+                RenderCommand::PushClipLayer(layer) => {
+                    let body =
+                        Self::resolve_command_range(commands, tolerance, visible_bounds, true)?;
+                    resolved.push(RenderCommand::PushClipLayer(layer));
+                    resolved.extend(body);
+                    resolved.push(RenderCommand::PopLayer);
+                }
+                RenderCommand::PushLayer(mut layer) => {
+                    let body =
+                        Self::resolve_command_range(commands, tolerance, visible_bounds, true)?;
+                    let Some(filter) = layer.filter.take() else {
+                        resolved.push(RenderCommand::PushLayer(layer));
+                        resolved.extend(body);
+                        resolved.push(RenderCommand::PopLayer);
+                        continue;
+                    };
+
+                    let layer_bounds = visible_bounds.intersect(
+                        layer
+                            .transform
+                            .transform_rect_bbox(layer.clip.bounding_box()),
+                    );
+                    if layer_bounds.width() <= 0.0 || layer_bounds.height() <= 0.0 {
+                        continue;
+                    }
+
+                    // Clip the source before filtering, as the backend's
+                    // filtered layer would. Keep the original layer around the
+                    // replacement too so its opacity, blend, and output clip
+                    // remain in their original compositing position.
+                    let mut source_commands = Vec::with_capacity(body.len() + 2);
+                    source_commands.push(RenderCommand::PushClipLayer(
+                        anyrender::recording::ClipCommand {
+                            transform: layer.transform,
+                            clip: layer.clip.clone(),
+                        },
+                    ));
+                    source_commands.extend(body);
+                    source_commands.push(RenderCommand::PopLayer);
+                    let source_scene = Scene {
+                        tolerance,
+                        commands: source_commands,
+                    };
+                    let (source, placement) =
+                        Self::rasterize_scene_image(source_scene, layer_bounds)
+                            .expect("nested filter bounds were validated from the outer pass");
+                    let filtered = Self::apply_single_threaded_filter(source, &filter)
+                        .expect("scene raster eligibility validated this filter primitive");
+
+                    resolved.push(RenderCommand::PushLayer(layer));
+                    let image_rect = Rect::new(
+                        0.0,
+                        0.0,
+                        f64::from(filtered.image.width),
+                        f64::from(filtered.image.height),
+                    );
+                    resolved.push(RenderCommand::Fill(anyrender::recording::FillCommand {
+                        fill: peniko::Fill::NonZero,
+                        transform: placement,
+                        brush: Paint::Image(filtered),
+                        brush_transform: None,
+                        shape: image_rect.to_path(tolerance),
+                    }));
+                    resolved.push(RenderCommand::PopLayer);
+                }
+                command => resolved.push(command),
+            }
+        }
+        (!stop_at_pop).then_some(resolved)
+    }
+
+    /// Render a filter-free recorded scene into its exact visible rectangle.
+    #[cfg(feature = "vello-cpu-filters")]
+    fn rasterize_scene_image(scene: Scene, bounds: Rect) -> Option<(ImageBrush, Affine)> {
+        let x0 = bounds.x0.floor();
+        let y0 = bounds.y0.floor();
+        let x1 = bounds.x1.ceil();
+        let y1 = bounds.y1.ceil();
+        let width = x1 - x0;
+        let height = y1 - y0;
+        if ![x0, y0, width, height].iter().all(|v| v.is_finite())
+            || width <= 0.0
+            || height <= 0.0
+            || width > f64::from(u16::MAX)
+            || height > f64::from(u16::MAX)
+        {
+            return None;
+        }
+        let width = width as u32;
+        let height = height as u32;
+        let offset = Affine::translate((-x0, -y0));
+        let scene = Self::resolve_nested_filter_layers(scene, bounds);
+        let mut renderer = FILTER_RENDERER
+            .with(|cached| cached.borrow_mut().take())
+            .filter(|(cached_width, cached_height, _)| {
+                *cached_width == width && *cached_height == height
+            })
+            .map(|(_, _, renderer)| renderer)
+            .unwrap_or_else(|| VelloCpuImageRenderer::new(width, height));
+        renderer.reset();
+        let mut pixels = Vec::new();
+        renderer.render_to_vec(
+            move |target| target.append_scene(scene, offset),
+            &mut pixels,
+        );
+        FILTER_RENDERER.with(|cached| {
+            cached.borrow_mut().replace((width, height, renderer));
+        });
+        Some((
+            Self::image_brush(pixels, width, height),
+            Affine::translate((x0, y0)),
+        ))
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    fn image_brush(pixels: Vec<u8>, width: u32, height: u32) -> ImageBrush {
+        ImageBrush {
+            image: ImageData {
+                data: Blob::new(Arc::new(pixels)),
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::AlphaPremultiplied,
+                width,
+                height,
+            },
+            sampler: ImageSampler {
+                x_extend: Extend::Pad,
+                y_extend: Extend::Pad,
+                quality: ImageQuality::Low,
+                alpha: 1.0,
+            },
+        }
+    }
+
+    /// Execute one accepted filter primitive with the runtime single-thread
+    /// dispatcher. This remains available when Vello CPU is compiled with its
+    /// `multithreading` feature; only `num_threads: 0` controls the dispatcher.
+    #[cfg(feature = "vello-cpu-filters")]
+    fn apply_single_threaded_filter(image: ImageBrush, filter: &Filter) -> Option<ImageBrush> {
+        let filter = convert_single_node_filter(filter)?;
+        let width = u16::try_from(image.image.width).ok()?;
+        let height = u16::try_from(image.image.height).ok()?;
+        let mut context = VelloRenderContext::new_with(
+            width,
+            height,
+            RenderSettings {
+                num_threads: 0,
+                ..RenderSettings::default()
+            },
+        );
+        context.push_layer(None, None, None, None, Some(filter));
+        context.set_transform(Affine::IDENTITY);
+        context.set_paint(PaintType::Image(VelloImage {
+            image: ImageSource::from_peniko_image_data(&image.image),
+            sampler: image.sampler,
+        }));
+        context.fill_path(&Rect::new(0.0, 0.0, f64::from(width), f64::from(height)).to_path(0.1));
+        context.pop_layer();
+
+        let mut pixels = vec![0; usize::from(width) * usize::from(height) * 4];
+        context.render(
+            PixmapMut::new(width, height, &mut pixels).expect("pixel buffer has exact dimensions"),
+            &mut Resources::new(),
+        );
+        Some(Self::image_brush(
+            pixels,
+            u32::from(width),
+            u32::from(height),
+        ))
+    }
+
     fn apply(&self, color: Color) -> Color {
         self.0.iter().fold(color, |acc, m| m.apply(acc))
     }
@@ -562,6 +902,9 @@ impl ColorMatrixChain {
         let width = width as u32;
         let height = height as u32;
         let offset = Affine::translate((-x0, -y0));
+        #[cfg(test)]
+        let offscreen_start = Instant::now();
+        let scene = Self::resolve_nested_filter_layers(scene, bounds);
         let mut renderer = FILTER_RENDERER
             .with(|cached| cached.borrow_mut().take())
             .filter(|(cached_width, cached_height, _)| {
@@ -571,8 +914,6 @@ impl ColorMatrixChain {
             .unwrap_or_else(|| VelloCpuImageRenderer::new(width, height));
         renderer.reset();
         let mut pixels = Vec::new();
-        #[cfg(test)]
-        let offscreen_start = Instant::now();
         renderer.render_to_vec(
             move |target| target.append_scene(scene, offset),
             &mut pixels,
@@ -1113,6 +1454,32 @@ mod tests {
         };
         assert_eq!(rgb(shadow.color), [255, 0, 0]);
         assert_eq!(rgb(chain.apply(shadow.color)), [0, 255, 255]);
+
+        assert!(
+            ColorMatrixChain::can_rasterize_scene_exactly(&paint_rewritten),
+            "a single drop-shadow primitive is executable by the single-thread pass"
+        );
+
+        let mut complex = Scene::default();
+        complex.push_layer(
+            Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &Rect::new(0.0, 0.0, 32.0, 32.0),
+            Some(Arc::new(anyrender::Filter::linear_list(
+                [
+                    anyrender::filters::FilterEffect::blur(1.0),
+                    anyrender::filters::FilterEffect::drop_shadow(2.0, 0.0, 0.0, red),
+                ]
+                .into_iter(),
+            ))),
+            None,
+        );
+        complex.pop_layer();
+        assert!(
+            !ColorMatrixChain::can_rasterize_scene_exactly(&complex),
+            "a multi-node graph must retain the old path instead of losing nodes"
+        );
     }
 
     /// A deterministic generator is enough here: this is a renderer invariant,

@@ -1042,6 +1042,8 @@ dependencies = [
  "taffy",
  "tracing",
  "usvg",
+ "vello_common",
+ "vello_cpu",
 ]
 
 [[package]]
