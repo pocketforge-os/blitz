@@ -1,23 +1,22 @@
-//! CSS `filter` colour-matrix shorthands, per Filter Effects 1.
+//! CSS `filter` colour-matrix shorthands.
 //!
 //! The expected values here are computed from the specification text, not from
-//! a previous render: §13.1 gives each shorthand's `<filter>` equivalent, §9.6
-//! and §9.7.1 give the arithmetic, and §5 fixes the colour space ("Filter
-//! Functions must operate in the sRGB color space") and the grouping ("All the
-//! elements descendants are rendered together as a group with the filter effect
-//! applied to the group as a whole").
+//! a previous render. The grouping requirement is: "All the elements descendants
+//! are rendered together as a group with the filter effect applied to the group
+//! as a whole." <https://drafts.csswg.org/filter-effects-1/#FilterProperty>
 //!
 //! The `wpt` runner cannot stand in for these: it compares a test render
 //! against a reference render made by the same engine, so a filter that is
 //! silently dropped from *both* still passes.
 
-use anyrender::render_to_buffer;
+use anyrender::{ImageRenderer, render_to_buffer};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_paint::paint_scene;
 use blitz_traits::shell::{ColorScheme, Viewport};
 use std::sync::Arc;
+use std::time::Instant;
 
 const W: u32 = 40;
 const H: u32 = 40;
@@ -38,6 +37,20 @@ fn render(body: &str) -> Vec<u8> {
         W,
         H,
     )
+}
+
+fn document(body: &str, width: u32, height: u32) -> HtmlDocument {
+    let html = format!(r#"<html><body style="margin:0; background:#fff;">{body}</body></html>"#);
+    let mut doc = HtmlDocument::from_html(
+        &html,
+        DocumentConfig {
+            viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
+            html_parser_provider: Some(Arc::new(HtmlProvider) as _),
+            ..Default::default()
+        },
+    );
+    doc.resolve(0.0);
+    doc
 }
 
 fn pixel(buf: &[u8], x: u32, y: u32) -> [u8; 3] {
@@ -64,7 +77,7 @@ fn block(filter: &str, color: &str) -> String {
     format!(r#"<div style="width:40px; height:40px; background:{color}; {filter}"></div>"#)
 }
 
-/// §13.1.7: `brightness(a)` is `feFuncR/G/B type="linear" slope="a"`, i.e.
+/// `brightness(a)` is `feFuncR/G/B type="linear" slope="a"`, i.e.
 /// `C' = a * C` on non-premultiplied sRGB.
 #[test]
 fn brightness_scales_every_channel() {
@@ -73,7 +86,7 @@ fn brightness_scales_every_channel() {
     assert_close(centre(&buf), [64, 32, 96], "brightness(0.5)");
 }
 
-/// §13.1.8: `contrast(a)` is `type="linear" slope="a"
+/// `contrast(a)` is `type="linear" slope="a"
 /// intercept="-(0.5 * a) + 0.5"`. At `a = 0` every channel collapses onto 0.5.
 #[test]
 fn contrast_zero_is_mid_grey() {
@@ -81,14 +94,14 @@ fn contrast_zero_is_mid_grey() {
     assert_close(centre(&buf), [128, 128, 128], "contrast(0)");
 }
 
-/// §13.1.5: `invert(1)` is `type="table" tableValues="1 0"`, i.e. `C' = 1 - C`.
+/// `invert(1)` is `type="table" tableValues="1 0"`, i.e. `C' = 1 - C`.
 #[test]
 fn invert_one_complements_every_channel() {
     let buf = render(&block("filter: invert(1);", "#8040c0"));
     assert_close(centre(&buf), [127, 191, 63], "invert(1)");
 }
 
-/// §13.1.4/§9.6: `hue-rotate(0deg)` collapses the hueRotate matrix onto the
+/// `hue-rotate(0deg)` collapses the hueRotate matrix onto the
 /// identity (`cos 0 = 1`, `sin 0 = 0`). It must be byte-identical to no filter
 /// at all -- this is the control that separates "the filter ran and did
 /// nothing" from "the filter was dropped".
@@ -99,7 +112,7 @@ fn hue_rotate_zero_is_byte_identical_to_no_filter() {
     assert_eq!(filtered, plain, "hue-rotate(0deg) changed the frame");
 }
 
-/// §9.6 `type="hueRotate"` at 90 degrees: `cos = 0`, `sin = 1`, so the matrix
+/// `type="hueRotate"` at 90 degrees: `cos = 0`, `sin = 1`, so the matrix
 /// is the constant term plus the sin term, e.g. the red row becomes
 /// `(0.213 - 0.213, 0.715 - 0.715, 0.072 + 0.928) = (0, 0, 1)`.
 #[test]
@@ -121,9 +134,8 @@ fn hue_rotate_ninety_matches_the_spec_matrix() {
     assert_close(centre(&buf), want, "hue-rotate(90deg)");
 }
 
-/// §5: "The list of functions are applied in the order provided", and §9.7.1
-/// puts `C` and `C'` "both in the closed interval [0,1]", so the chain clamps
-/// between functions. `brightness(4)` saturates a mid grey to white before
+/// The chain applies functions in author order and clamps to `[0,1]` between
+/// them. `brightness(4)` saturates a mid grey to white before
 /// `contrast(0.5)` maps it to 0.75 -- a single composed matrix without the
 /// intermediate clamp would give 0.752.
 #[test]
@@ -132,8 +144,8 @@ fn a_chain_applies_in_order_with_clamping_between() {
     assert_close(centre(&buf), [191, 191, 191], "brightness(4) contrast(0.5)");
 }
 
-/// The design-authority declaration from PocketForge's Poolsuite app,
-/// `filter: brightness(.55) contrast(1.2)` on a selected desktop icon.
+/// A representative `filter: brightness(.55) contrast(1.2)` on a selected
+/// desktop icon.
 /// (128, 64, 192) -> x0.55 -> (70.4, 35.2, 105.6) -> x1.2 - 0.1*255 ->
 /// (58.98, 16.74, 101.22).
 #[test]
@@ -147,8 +159,8 @@ fn brightness_then_contrast_darkens_a_selected_icon() {
     assert_close(centre(&buf), want, "brightness(.55) contrast(1.2)");
 }
 
-/// §5: the filter applies to the element "and its descendants [...] as a
-/// group". A child painted inside a filtered ancestor must be filtered even
+/// A filter applies to the element and its descendants as one group. A child
+/// painted inside a filtered ancestor must be filtered even
 /// though the child carries no `filter` of its own.
 #[test]
 fn the_filter_covers_descendants() {
@@ -160,7 +172,7 @@ fn the_filter_covers_descendants() {
 }
 
 /// A translucent child over an opaque background inside the filtered group.
-/// §5 composites the group first and filters the result, so the expected value
+/// The group composites first and filters the result, so the expected value
 /// is `f(0.5 * blue + 0.5 * white)`, not `f(blue)` alone. `contrast(0.5)`
 /// carries a non-zero intercept, which is the term a per-paint rewrite has to
 /// get right for this to agree.
@@ -182,8 +194,70 @@ fn a_translucent_overlap_matches_the_filtered_composite() {
     );
 }
 
-/// §5: "first any filter effect is applied, then any clipping, masking and
-/// opacity". Element opacity multiplies the already-filtered group, so a black
+/// The filter sees the composited group, so the half-transparent white child first
+/// produces mid-grey over black and `brightness(2)` then clamps that result to white.
+#[test]
+fn brightness_clamps_after_a_translucent_child_is_composited() {
+    let body = r#"<div style="width:40px; height:40px; background:#000; filter:brightness(2);">
+        <div style="width:40px; height:40px; background:rgba(255,255,255,0.5);"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        centre(&buf),
+        [255, 255, 255],
+        "brightness(2) after translucent compositing",
+    );
+}
+
+/// Antialiasing is partial coverage and therefore another translucent composite.
+/// Find a non-trivial edge texel in an unfiltered reference and verify that the
+/// filtered group doubles that composited value, rather than filtering opaque white
+/// before its coverage is applied.
+#[test]
+fn brightness_filters_an_antialiased_edge_after_coverage() {
+    let plain = render(
+        r#"<div style="width:40px; height:40px; background:#000;">
+            <div style="width:24px; height:24px; border-radius:50%; background:#fff;"></div>
+        </div>"#,
+    );
+    let filtered = render(
+        r#"<div style="width:40px; height:40px; background:#000; filter:brightness(2);">
+            <div style="width:24px; height:24px; border-radius:50%; background:#fff;"></div>
+        </div>"#,
+    );
+
+    let (index, source) = plain
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .find(|(_, px)| px[0] >= 32 && px[0] <= 160 && px[0] == px[1] && px[1] == px[2])
+        .map(|(index, px)| (index, px[0]))
+        .expect("the rounded edge should contain a partially covered texel");
+    let got = filtered.as_chunks::<4>().0[index][0];
+    let want = source.saturating_mul(2);
+    assert!(
+        got.abs_diff(want) <= 2,
+        "antialiased edge: source coverage {source}, got {got}, expected {want} (+/-2)"
+    );
+}
+
+/// `contrast(2)` maps values below 0.25 below zero. The translucent white child
+/// composites to 0.2 over black, so filtering the group clamps it to black.
+#[test]
+fn contrast_clamps_below_zero_after_translucent_compositing() {
+    let body = r#"<div style="width:40px; height:40px; background:#000; filter:contrast(2);">
+        <div style="width:40px; height:40px; background:rgba(255,255,255,0.2);"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        centre(&buf),
+        [0, 0, 0],
+        "contrast(2) below-zero clamp after translucent compositing",
+    );
+}
+
+/// Element opacity multiplies the already-filtered group, so a black
 /// result at 50% over white is mid grey either way -- but an implementation
 /// that filtered *after* opacity would lift the black towards the backdrop
 /// before inverting it.
@@ -193,7 +267,7 @@ fn opacity_is_applied_after_the_filter() {
     assert_close(centre(&buf), [128, 128, 128], "invert(1) under opacity 0.5");
 }
 
-/// A gradient is one paint but many pixel colours, and §9.7.1's `[0,1]` clamp
+/// A gradient is one paint but many pixel colours, and the `[0,1]` clamp
 /// is applied per pixel, after the ramp is interpolated. Filtering only the
 /// authored stops and letting the renderer interpolate between already-clamped
 /// results is a different function, because clamping does not commute with
@@ -255,4 +329,74 @@ fn a_clamping_gradient_is_filtered_per_pixel_not_per_stop() {
 fn a_blur_filter_does_not_panic() {
     let buf = render(&block("filter: blur(2px);", "#8040c0"));
     assert_eq!(buf.len() as u32, W * H * 4);
+}
+
+/// Manual release-mode cost probe for the two representative filter shapes used
+/// to assess this implementation. This is ignored during the normal test suite.
+#[test]
+#[ignore = "manual 1280x720 frame-time benchmark"]
+fn filtered_subtree_frame_cost_1280x720() {
+    const WIDTH: u32 = 1280;
+    const HEIGHT: u32 = 720;
+    const WARMUPS: usize = 5;
+    const RUNS: usize = 30;
+
+    let full_screen = r#"<main style="width:1280px; height:720px; filter:hue-rotate(92deg);
+        background:linear-gradient(135deg,#d04480,#40a0dc);">
+        <div style="width:900px; height:520px; background:rgba(255,255,255,.35);"></div>
+        <div style="width:700px; height:420px; margin:-360px 0 0 420px;
+            border-radius:80px; background:rgba(20,30,60,.55);"></div>
+    </main>"#;
+
+    let mut icon_grid = String::from(
+        r#"<main style="width:1280px; height:720px; background:#246; padding:32px;">"#,
+    );
+    for i in 0..48 {
+        let filter = if i % 4 == 0 {
+            "filter:brightness(.55) contrast(1.2);"
+        } else {
+            ""
+        };
+        icon_grid.push_str(&format!(
+            r#"<div style="display:inline-block; width:96px; height:96px; margin:12px;
+                border-radius:18px; background:linear-gradient(45deg,#e86,#68e);{filter}"></div>"#,
+        ));
+    }
+    icon_grid.push_str("</main>");
+
+    for (name, body) in [
+        ("full_screen_hue_rotate", full_screen.to_owned()),
+        ("icon_grid_brightness_contrast", icon_grid),
+    ] {
+        let mut doc = document(&body, WIDTH, HEIGHT);
+        let mut renderer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
+        let mut buffer = Vec::new();
+
+        for _ in 0..WARMUPS {
+            renderer.reset();
+            renderer.render_to_vec(
+                |scene| paint_scene(scene, doc.as_mut(), 1.0, WIDTH, HEIGHT, 0, 0),
+                &mut buffer,
+            );
+        }
+
+        let mut samples = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            renderer.reset();
+            let start = Instant::now();
+            renderer.render_to_vec(
+                |scene| paint_scene(scene, doc.as_mut(), 1.0, WIDTH, HEIGHT, 0, 0),
+                &mut buffer,
+            );
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / RUNS as f64;
+        println!(
+            "FILTER_BENCH {name} runs={RUNS} min_ms={:.3} median_ms={:.3} max_ms={:.3} mean_ms={mean:.3}",
+            samples[0],
+            samples[RUNS / 2],
+            samples[RUNS - 1],
+        );
+    }
 }

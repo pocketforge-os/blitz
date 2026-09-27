@@ -1,11 +1,10 @@
 //! The colour-matrix subset of the CSS `filter` shorthand functions.
 //!
-//! [Filter Effects 1 §13.1][shorthands] defines every shorthand filter function
-//! as an equivalent `<filter>` element. Seven of the ten expand to a single
-//! `feColorMatrix`, or to an `feComponentTransfer` whose `feFuncR`/`feFuncG`/
-//! `feFuncB` are `type="linear"` or a two-entry `type="table"`:
+//! Seven shorthand filter functions expand to a single `feColorMatrix`, or to
+//! an `feComponentTransfer` whose `feFuncR`/`feFuncG`/`feFuncB` are
+//! `type="linear"` or a two-entry `type="table"`:
 //!
-//! | function | §13.1 equivalent |
+//! | function | equivalent primitive |
 //! |---|---|
 //! | `grayscale(a)`   | `feColorMatrix type="matrix"` |
 //! | `sepia(a)`       | `feColorMatrix type="matrix"` |
@@ -17,7 +16,7 @@
 //!
 //! Each of those seven is an affine map of the **non-premultiplied** RGB triple
 //! that leaves alpha alone, so all seven are represented here by the same 4×5
-//! matrix `feColorMatrix type="matrix"` uses ([Filter Effects 1 §9.6][matrix]):
+//! matrix `feColorMatrix type="matrix"` uses:
 //!
 //! ```text
 //! | R' |   | a00 a01 a02 a03 a04 |   | R |
@@ -33,69 +32,43 @@
 //! — see [`ColorMatrixChain::from_filters`] for why alpha-scaling cannot join
 //! this path.
 //!
-//! # Why this can be applied per source colour
+//! # Composited-group filtering
 //!
-//! [Filter Effects 1 §5][filter-prop] describes the model as: the element and
-//! its descendants are "rendered together as a group with the filter effect
-//! applied to the group as a whole", i.e. drawn into a buffer, filtered, then
-//! composited into the parent. A renderer without an offscreen target for that
-//! buffer can still produce **exactly** that result for this subset, because an
-//! affine, alpha-preserving colour map commutes with `source-over`.
+//! The normative requirement is: "All the elements descendants are rendered
+//! together as a group with the filter effect applied to the group as a whole."
+//! <https://drafts.csswg.org/filter-effects-1/#FilterProperty>
 //!
-//! Write the map as `f(C) = M·C + t` on non-premultiplied colour, with alpha
-//! untouched, and let `P = A·C` be premultiplied colour. Compositing one
-//! source over one destination gives
+//! With `vello-cpu-filters`, the subtree is recorded, rasterised into a bounded
+//! premultiplied RGBA buffer, transformed one pixel at a time, and then
+//! composited into the parent. The clamp belongs here, after the subtree has
+//! composited. Applying and clamping the matrix to each source paint is not
+//! equivalent: a translucent white source can clamp before its coverage is
+//! mixed with a dark destination, producing a different result.
 //!
-//! ```text
-//! P  = Pₛ + (1 - Aₛ)·P_d          A  = Aₛ + (1 - Aₛ)·A_d
-//! ```
-//!
-//! Filtering the *composite* yields premultiplied `A·f(P/A) = M·P + t·A`.
-//! Filtering each *source* first and then compositing yields
-//!
-//! ```text
-//! (M·Pₛ + t·Aₛ) + (1 - Aₛ)·(M·P_d + t·A_d) = M·P + t·A
-//! ```
-//!
-//! — the same value. The induction extends over any number of source-over
-//! draws, and over group opacity (a scalar on both `P` and `A`), so a whole
-//! recorded subtree can be filtered by rewriting the colour of each paint in
-//! it. This equivalence holds only while alpha compositing is unchanged by the
-//! map (hence no `opacity()`) and the group is composited with separable
-//! Porter-Duff operators whose factors depend on alpha alone; `blitz-paint`
-//! pushes only [`peniko::Mix::Normal`] layers today. A non-`Normal`
-//! `mix-blend-mode` inside a filtered subtree would be non-linear in colour and
-//! would have to take the offscreen path instead.
-//!
-//! # What "every paint" does and does not reach
-//!
-//! The rewrite reaches solid paints, gradient ramps and image pixels. It also
-//! reaches a nested `blur()` exactly, because a Gaussian convolution is linear
-//! and so commutes with the affine map just as compositing does.
-//!
-//! It does **not** reach a descendant's `drop-shadow()`. [`crate::filters`]
-//! carries that shadow's colour as `push_layer` metadata on an
-//! `anyrender::Filter`, never as a `Fill`/`Stroke` paint, and a recorded
-//! `PushLayer` has no colour this module can rewrite. So a `drop-shadow()`
-//! inside a colour-matrix-filtered ancestor escapes the ancestor's filter,
-//! which is a §5 group violation. Reaching it would mean rewriting the
-//! `FilterEffect::DropShadow` colour inside a nested `Filter` graph, which is
-//! only worth doing once a backend executes those graphs at all — today
-//! `vello_cpu` drops every `ColorMatrix`/`ComponentTransfer` primitive, so the
-//! nested shadow is unfiltered either way.
-//!
-//! [shorthands]: https://drafts.fxtf.org/filter-effects-1/#ShorthandEquivalents
-//! [matrix]: https://drafts.fxtf.org/filter-effects-1/#feColorMatrixElement
-//! [filter-prop]: https://drafts.fxtf.org/filter-effects-1/#FilterProperty
+//! The pinned Vello CPU renderer does not execute colour-matrix primitives and
+//! its multithreaded dispatcher rejects every filter layer, so `blitz-paint`
+//! supplies the offscreen pass and reuses one renderer's scratch allocations.
+//! Builds without that feature retain the older per-paint rewrite as a
+//! compatibility fallback for backends without an offscreen seam.
 
 use anyrender::Paint;
 use anyrender::recording::{RenderCommand, Scene};
+#[cfg(feature = "vello-cpu-filters")]
+use anyrender::{ImageRenderer as _, PaintScene as _};
+#[cfg(feature = "vello-cpu-filters")]
+use anyrender_vello_cpu::VelloCpuImageRenderer;
 use color::{ColorSpaceTag, DynamicColor, Srgb};
+#[cfg(feature = "vello-cpu-filters")]
+use kurbo::{Affine, Rect};
 use peniko::{
     Blob, ColorStop, ColorStops, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
     InterpolationAlphaSpace,
 };
+#[cfg(feature = "vello-cpu-filters")]
+use peniko::{Extend, ImageQuality, ImageSampler};
 use smallvec::SmallVec;
+#[cfg(feature = "vello-cpu-filters")]
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::color::Color;
@@ -107,23 +80,29 @@ use crate::filters::StyloFilter;
 /// chain cannot grow the ramp without bound.
 const MAX_SEGMENT_STOPS: usize = 32;
 
-/// Luminance coefficients `feColorMatrix type="saturate"` and `type="hueRotate"`
-/// are written with in Filter Effects 1 §9.6.
+#[cfg(feature = "vello-cpu-filters")]
+thread_local! {
+    /// Keep one renderer's scratch allocations warm without retaining one
+    /// framebuffer for every distinct animated element size ever observed.
+    static FILTER_RENDERER: RefCell<Option<(u32, u32, VelloCpuImageRenderer)>> =
+        const { RefCell::new(None) };
+}
+
+/// Published luminance coefficients for `feColorMatrix type="saturate"` and
+/// `type="hueRotate"`.
 const LUMA_SATURATE: [f32; 3] = [0.213, 0.715, 0.072];
-/// Luminance coefficients the `grayscale()` shorthand is written with in
-/// Filter Effects 1 §13.1.1. Deliberately *not* [`LUMA_SATURATE`]: the
-/// specification spells the two out to different precisions and this module
-/// reproduces each as published.
+/// `grayscale()` uses slightly different published luminance coefficients. Deliberately
+/// *not* [`LUMA_SATURATE`]: this module reproduces each set as published.
 const LUMA_GRAYSCALE: [f32; 3] = [0.2126, 0.7152, 0.0722];
 
 /// A single `feColorMatrix type="matrix"` operation: four rows of
 /// `[R, G, B, A, offset]` coefficients, in the row-major order the `values`
-/// attribute lists them (Filter Effects 1 §9.6).
+/// attribute lists them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ColorMatrix([f32; 20]);
 
 impl ColorMatrix {
-    /// The identity matrix, which §9.6 names as the default for `type="matrix"`.
+    /// The default identity matrix for `type="matrix"`.
     pub(crate) const IDENTITY: Self = Self([
         1.0, 0.0, 0.0, 0.0, 0.0, //
         0.0, 1.0, 0.0, 0.0, 0.0, //
@@ -147,7 +126,7 @@ impl ColorMatrix {
 
     /// The same affine transfer function on each of R, G and B, as the
     /// `feFuncR`/`feFuncG`/`feFuncB` `type="linear"` form
-    /// `C' = slope * C + intercept` (Filter Effects 1 §9.7.1).
+    /// `C' = slope * C + intercept`.
     const fn linear_transfer(slope: f32, intercept: f32) -> Self {
         Self::from_rgb_rows([
             [slope, 0.0, 0.0, intercept],
@@ -156,31 +135,30 @@ impl ColorMatrix {
         ])
     }
 
-    /// `brightness(amount)` — §13.1.7: `feFuncR/G/B type="linear" slope="[amount]"`.
+    /// `brightness(amount)`: `feFuncR/G/B type="linear" slope="[amount]"`.
     pub(crate) fn brightness(amount: f32) -> Self {
         Self::linear_transfer(amount, 0.0)
     }
 
-    /// `contrast(amount)` — §13.1.8: `type="linear" slope="[amount]"
+    /// `contrast(amount)`: `type="linear" slope="[amount]"
     /// intercept="-(0.5 * [amount]) + 0.5"`.
     pub(crate) fn contrast(amount: f32) -> Self {
         Self::linear_transfer(amount, -(0.5 * amount) + 0.5)
     }
 
-    /// `invert(amount)` — §13.1.5: `type="table" tableValues="[amount] (1 - [amount])"`.
+    /// `invert(amount)`: `type="table" tableValues="[amount] (1 - [amount])"`.
     ///
-    /// A two-entry table is one interpolation region, so §9.7.1's
+    /// A two-entry table is one interpolation region, so
     /// `C' = v_k + (C - k/n) * n * (v_{k+1} - v_k)` with `n = 1, k = 0` reduces
     /// to the affine `C' = amount + C * (1 - 2 * amount)`.
     ///
-    /// §6.1: "Values of amount over 100% are allowed but UAs must clamp the
-    /// values to 1."
+    /// Amounts above one clamp to one.
     pub(crate) fn invert(amount: f32) -> Self {
         let amount = amount.clamp(0.0, 1.0);
         Self::linear_transfer(1.0 - 2.0 * amount, amount)
     }
 
-    /// `saturate(amount)` — §13.1.3 via `feColorMatrix type="saturate"` (§9.6).
+    /// `saturate(amount)` via `feColorMatrix type="saturate"`.
     pub(crate) fn saturate(amount: f32) -> Self {
         let [lr, lg, lb] = LUMA_SATURATE;
         let s = amount;
@@ -191,10 +169,10 @@ impl ColorMatrix {
         ])
     }
 
-    /// `grayscale(amount)` — §13.1.1, written there as a `type="matrix"` whose
+    /// `grayscale(amount)`, written as a `type="matrix"` whose
     /// coefficients are expressed in terms of `[1 - amount]`.
     ///
-    /// §6.1: over-100% amounts are clamped to 1.
+    /// Amounts above one clamp to one.
     pub(crate) fn grayscale(amount: f32) -> Self {
         let k = 1.0 - amount.clamp(0.0, 1.0);
         let [lr, lg, lb] = LUMA_GRAYSCALE;
@@ -205,9 +183,9 @@ impl ColorMatrix {
         ])
     }
 
-    /// `sepia(amount)` — §13.1.2, as published.
+    /// The published `sepia(amount)` matrix.
     ///
-    /// §6.1: over-100% amounts are clamped to 1.
+    /// Amounts above one clamp to one.
     pub(crate) fn sepia(amount: f32) -> Self {
         let k = 1.0 - amount.clamp(0.0, 1.0);
         Self::from_rgb_rows([
@@ -217,13 +195,13 @@ impl ColorMatrix {
         ])
     }
 
-    /// `hue-rotate(angle)` — §13.1.4 via `feColorMatrix type="hueRotate"`, whose
-    /// 3×3 is spelled out in §9.6 as a constant matrix plus `cos` and `sin`
-    /// terms. `angle` is in radians; §6.1 requires it not be normalised.
+    /// `hue-rotate(angle)` via `feColorMatrix type="hueRotate"`, whose 3×3 is
+    /// a constant matrix plus `cos` and `sin` terms. `angle` is in radians and
+    /// is deliberately not normalised.
     pub(crate) fn hue_rotate(angle_radians: f32) -> Self {
         let (sin, cos) = angle_radians.sin_cos();
         let [lr, lg, lb] = LUMA_SATURATE;
-        // Filter Effects 1 §9.6, `type="hueRotate"`.
+        // Published `type="hueRotate"` matrix.
         #[rustfmt::skip]
         let base = [
             [lr, lg, lb],
@@ -253,18 +231,13 @@ impl ColorMatrix {
 
     /// Apply the matrix to one non-premultiplied sRGB colour.
     ///
-    /// §9.1: "Some filters like `feColorMatrix` and `feComponentTransfer` work
-    /// more naturally on non-premultiplied data"; §9.6: "The calculations are
-    /// performed on non-premultiplied color values". §5 pins the space: "Filter
-    /// Functions must operate in the sRGB color space", so this operates
-    /// directly on the sRGB-encoded components rather than linearising them.
-    /// §9.7.1 states `C` and `C'` are "both in the closed interval [0,1]", so
-    /// the result is clamped.
+    /// The filter arithmetic uses non-premultiplied, sRGB-encoded components;
+    /// results are clamped to the closed interval `[0,1]`.
     /// Apply the matrix to a vector in the space the backend interpolates
     /// gradients in, **without** clamping.
     ///
-    /// For plain components this is the matrix straight off §9.6. For
-    /// premultiplied components, scaling §9.6's `C' = M·C + t` by alpha gives
+    /// For plain components this is the matrix directly. For premultiplied
+    /// components, scaling `C' = M·C + t` by alpha gives
     /// `P' = M·P + t·A`, which is affine in the vector — the reason this path
     /// requires a zero alpha column, since `A * (m·A)` would be quadratic.
     fn apply_vector(&self, vector: [f32; 4], premultiplied: bool) -> [f32; 4] {
@@ -303,13 +276,9 @@ impl ColorMatrix {
 
 /// The ordered list of colour matrices a `filter` value expands to.
 ///
-/// §5: "The list of functions are applied in the order provided. The first
-/// filter function [...] takes the element (`SourceGraphic`) as the input image.
-/// Subsequent operations take the output from the previous filter function
-/// [...] as the input image." The matrices are therefore applied one at a time
-/// with the §9.7.1 `[0,1]` clamp between them, not pre-multiplied into a single
-/// matrix: composing them would skip the intermediate clamps and diverge from
-/// the specified pipeline whenever an intermediate leaves the unit range.
+/// Matrices are applied one at a time in author order with a `[0,1]` clamp
+/// between them. Pre-multiplying them would skip the intermediate clamps and
+/// diverge whenever an intermediate result leaves the unit range.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ColorMatrixChain(SmallVec<[ColorMatrix; 2]>);
 
@@ -319,20 +288,10 @@ impl ColorMatrixChain {
     /// Returns `None` unless **every** function in the list is one of the seven
     /// alpha-preserving colour-matrix shorthands. A list containing `blur()`,
     /// `drop-shadow()`, `opacity()` or a `url()` reference is left entirely to
-    /// the [`crate::filters`] `Filter` graph, because:
-    ///
-    /// * `blur()` and `drop-shadow()` sample neighbouring pixels, which a
-    ///   per-paint colour rewrite cannot express at all; and
-    /// * `opacity()` scales alpha, and alpha scaling does *not* commute with
-    ///   `source-over` — for two overlapping sources, scaling each alpha by `k`
-    ///   gives `k·Aₛ + (1 - k·Aₛ)·k·A_d`, while scaling the composite gives
-    ///   `k·(Aₛ + (1 - Aₛ)·A_d)`, and those differ by `k(1-k)·Aₛ·A_d`. The
-    ///   module-level proof of the per-source rewrite depends on alpha
-    ///   compositing being untouched.
-    ///
-    /// Mixing the two mechanisms on one element is not attempted: the spec
-    /// pipeline is ordered, and interleaving an offscreen pass with a per-paint
-    /// rewrite would apply them out of order.
+    /// the [`crate::filters`] `Filter` graph. `blur()` and `drop-shadow()` are
+    /// spatial, `opacity()` changes alpha, and mixing these with the pixel
+    /// matrix path would require an ordered multi-stage filter graph that the
+    /// pinned renderer does not support.
     pub(crate) fn from_filters(filters: &[StyloFilter]) -> Option<Self> {
         if filters.is_empty() {
             return None;
@@ -358,11 +317,8 @@ impl ColorMatrixChain {
 
     /// Whether the chain leaves every colour unchanged.
     ///
-    /// `hue-rotate(0deg)` is exactly the identity by §9.6 (`cos 0 = 1`,
-    /// `sin 0 = 0` collapses the hueRotate matrix onto the identity), and §9.6
-    /// says a `hueRotate` value of 0 "results in the identity matrix". Skipping
-    /// the rewrite for such a chain keeps a no-op `filter` byte-identical to no
-    /// `filter` at all.
+    /// `hue-rotate(0deg)` is exactly the identity (`cos 0 = 1`, `sin 0 = 0`).
+    /// Skipping such a chain keeps a no-op filter byte-identical to no filter.
     pub(crate) fn is_identity(&self) -> bool {
         self.0.iter().all(|m| *m == ColorMatrix::IDENTITY)
     }
@@ -375,12 +331,97 @@ impl ColorMatrixChain {
         DynamicColor::from_alpha_color(self.apply(color.to_alpha_color::<Srgb>()))
     }
 
-    /// Rewrite every colour a recorded sub-scene paints.
+    /// Rasterise the recorded subtree, apply this chain once to its composited
+    /// premultiplied pixels, and return an image placed in device space.
     ///
-    /// The recording is the "buffer" of the §5 rendering model: the filtered
-    /// element and its descendants were painted into it as a group, and this
-    /// applies the filter to that group before it is composited into the
-    /// parent scene.
+    /// The normative requirement is: "All the elements descendants are rendered
+    /// together as a group with the filter effect applied to the group as a whole."
+    /// <https://drafts.csswg.org/filter-effects-1/#FilterProperty>
+    #[cfg(feature = "vello-cpu-filters")]
+    pub(crate) fn rasterize_composited_scene(
+        &self,
+        scene: Scene,
+        bounds: Rect,
+    ) -> Result<(ImageBrush, Affine), Scene> {
+        let x0 = bounds.x0.floor();
+        let y0 = bounds.y0.floor();
+        let x1 = bounds.x1.ceil();
+        let y1 = bounds.y1.ceil();
+        let width = x1 - x0;
+        let height = y1 - y0;
+        if ![x0, y0, width, height].iter().all(|v| v.is_finite())
+            || width <= 0.0
+            || height <= 0.0
+            || width > f64::from(u16::MAX)
+            || height > f64::from(u16::MAX)
+        {
+            return Err(scene);
+        }
+        let width = width as u32;
+        let height = height as u32;
+        let offset = Affine::translate((-x0, -y0));
+        let mut renderer = FILTER_RENDERER
+            .with(|cached| cached.borrow_mut().take())
+            .filter(|(cached_width, cached_height, _)| {
+                *cached_width == width && *cached_height == height
+            })
+            .map(|(_, _, renderer)| renderer)
+            .unwrap_or_else(|| VelloCpuImageRenderer::new(width, height));
+        renderer.reset();
+        let mut pixels = Vec::new();
+        renderer.render_to_vec(
+            move |target| target.append_scene(scene, offset),
+            &mut pixels,
+        );
+        FILTER_RENDERER.with(|cached| {
+            cached.borrow_mut().replace((width, height, renderer));
+        });
+        self.apply_to_premultiplied_rgba8(&mut pixels);
+
+        let image = ImageBrush {
+            image: ImageData {
+                data: Blob::new(Arc::new(pixels)),
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::AlphaPremultiplied,
+                width,
+                height,
+            },
+            sampler: ImageSampler {
+                x_extend: Extend::Pad,
+                y_extend: Extend::Pad,
+                quality: ImageQuality::Low,
+                alpha: 1.0,
+            },
+        };
+        Ok((image, Affine::translate((x0, y0))))
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    fn apply_to_premultiplied_rgba8(&self, pixels: &mut [u8]) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            let alpha = f32::from(pixel[3]) / 255.0;
+            if alpha == 0.0 {
+                continue;
+            }
+            let unpremultiply = 1.0 / (255.0 * alpha);
+            let source = Color::new([
+                f32::from(pixel[0]) * unpremultiply,
+                f32::from(pixel[1]) * unpremultiply,
+                f32::from(pixel[2]) * unpremultiply,
+                alpha,
+            ]);
+            let filtered = self.apply(source);
+            for (channel, value) in pixel[..3].iter_mut().zip(filtered.components[..3].iter()) {
+                *channel = (value * alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    /// Compatibility fallback for a backend without an offscreen pass.
+    ///
+    /// This rewrites individual paints and therefore cannot reproduce a clamp
+    /// that occurs after translucent sources have composited. The Vello CPU
+    /// feature takes [`Self::rasterize_composited_scene`] instead.
     pub(crate) fn apply_to_scene(&self, scene: &mut Scene) {
         if self.is_identity() {
             return;
@@ -415,8 +456,8 @@ impl ColorMatrixChain {
 
     /// Rewrite a gradient's colour ramp.
     ///
-    /// A gradient is one paint but many pixel colours, and §9.6's `[0,1]` clamp
-    /// is applied per *pixel*, after the ramp is interpolated. Filtering only
+    /// A gradient is one paint but many pixel colours, and its `[0,1]` clamp is
+    /// applied per *pixel*, after the ramp is interpolated. Filtering only
     /// the authored stops and letting the backend interpolate between the
     /// already-clamped results is therefore **not** the same function: the
     /// affine part commutes with interpolation, but the clamp does not. For
@@ -577,11 +618,9 @@ impl ColorMatrixChain {
 
     /// Rewrite an image brush's pixels.
     ///
-    /// §9.6 requires the calculation on non-premultiplied values, so
-    /// premultiplied source pixels are divided out first and multiplied back
-    /// afterwards. Fully transparent pixels have no colour to filter and are
-    /// left as they are; a matrix offset applied to them would be multiplied by
-    /// a zero alpha again on the way out regardless.
+    /// Matrix calculation uses non-premultiplied values, so premultiplied
+    /// source pixels are divided out first and multiplied back afterwards.
+    /// Fully transparent pixels have no colour to filter and are left alone.
     fn apply_to_image(&self, brush: &mut ImageBrush) {
         let image = &mut brush.image;
         // `ImageFormat` is `#[non_exhaustive]`: a variant this code has never
@@ -654,8 +693,8 @@ fn from_vector(vector: [f32; 4], premultiplied: bool) -> DynamicColor {
     DynamicColor::from_alpha_color(Color::new(components))
 }
 
-/// Clamp the colour channels to §9.7.1's closed interval `[0,1]`, expressed in
-/// whichever space the vector is in: premultiplied colour is bounded by alpha.
+/// Clamp colour channels to `[0,1]`, expressed in whichever space the vector
+/// uses: premultiplied colour is bounded by alpha.
 fn clamp_vector(mut vector: [f32; 4], premultiplied: bool) -> [f32; 4] {
     let upper = if premultiplied { vector[3] } else { 1.0 };
     for channel in &mut vector[..3] {
@@ -677,7 +716,7 @@ mod tests {
 
     #[test]
     fn hue_rotate_zero_is_the_identity_matrix() {
-        // §9.6: a `hueRotate` value of 0 "results in the identity matrix".
+        // Zero rotation collapses the matrix to identity.
         let m = ColorMatrix::hue_rotate(0.0);
         for (got, want) in m.0.iter().zip(ColorMatrix::IDENTITY.0.iter()) {
             assert!((got - want).abs() < 1e-6, "{:?} != identity", m.0);
@@ -687,8 +726,7 @@ mod tests {
 
     #[test]
     fn hue_rotate_360_degrees_is_not_normalised_away() {
-        // §6.1: "Implementations must not normalize this value in order to
-        // allow animations beyond 360deg" — but a full turn is still identity.
+        // Do not normalize the authored angle; a full turn is still identity.
         let m = ColorMatrix::hue_rotate(std::f32::consts::TAU);
         let out = m.apply(MID);
         for i in 0..3 {
@@ -707,9 +745,9 @@ mod tests {
 
     #[test]
     fn brightness_is_a_linear_slope() {
-        // §13.1.7: slope = amount, intercept = 0.
+        // slope = amount, intercept = 0.
         assert_eq!(rgb(ColorMatrix::brightness(0.5).apply(MID)), [64, 32, 96]);
-        // Over-100% is allowed (§6.1) and clamps at the top of the range (§9.7.1).
+        // Amounts over one are allowed and the result clamps at the top.
         assert_eq!(
             rgb(ColorMatrix::brightness(4.0).apply(MID)),
             [255, 255, 255]
@@ -718,7 +756,7 @@ mod tests {
 
     #[test]
     fn contrast_uses_the_specified_intercept() {
-        // §13.1.8: C' = a·C + (-(0.5a) + 0.5). At a = 0 every channel is 0.5.
+        // C' = a·C + (-(0.5a) + 0.5). At a = 0 every channel is 0.5.
         assert_eq!(rgb(ColorMatrix::contrast(0.0).apply(MID)), [128, 128, 128]);
         // a = 1 is the identity.
         assert_eq!(rgb(ColorMatrix::contrast(1.0).apply(MID)), rgb(MID));
@@ -726,11 +764,11 @@ mod tests {
 
     #[test]
     fn invert_reads_the_two_entry_table() {
-        // §13.1.5 with amount = 1: C' = 1 - C.
+        // At amount = 1: C' = 1 - C.
         assert_eq!(rgb(ColorMatrix::invert(1.0).apply(MID)), [127, 191, 63]);
         // amount = 0.5 collapses every channel onto 0.5.
         assert_eq!(rgb(ColorMatrix::invert(0.5).apply(MID)), [128, 128, 128]);
-        // §6.1: over-100% clamps to 1.
+        // Amounts above one clamp to one.
         assert_eq!(
             rgb(ColorMatrix::invert(2.0).apply(MID)),
             rgb(ColorMatrix::invert(1.0).apply(MID))
@@ -746,7 +784,7 @@ mod tests {
 
     #[test]
     fn grayscale_one_uses_the_published_luma_coefficients() {
-        // §13.1.1 with amount = 1: every row is (0.2126, 0.7152, 0.0722).
+        // At amount = 1 every row is (0.2126, 0.7152, 0.0722).
         let out = ColorMatrix::grayscale(1.0).apply(MID);
         let luma = 0.2126 * (128.0 / 255.0) + 0.7152 * (64.0 / 255.0) + 0.0722 * (192.0 / 255.0);
         for i in 0..3 {
@@ -842,7 +880,7 @@ mod tests {
         }
     }
 
-    /// The clamp in §9.7.1 is per pixel, and clamping does not commute with
+    /// The clamp is per pixel, and clamping does not commute with
     /// interpolation. Filtering only the authored stops would leave the ramp
     /// ~29/255 away from the per-pixel answer around the crossing at
     /// x = 0.326923; subdividing there makes it exact.

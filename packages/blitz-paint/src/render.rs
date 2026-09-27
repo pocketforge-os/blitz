@@ -469,13 +469,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // Save it so that the mask can be drawn untransformed by scroll offsets.
                 let unscrolled_transform = cx.transform;
 
-                // Filter Effects 1 §13.1 expands seven of the ten shorthand
-                // filter functions to an alpha-preserving colour matrix. Those
-                // are applied by rewriting the colours of the recorded subtree
-                // (see `crate::color_matrix`), which is exactly equivalent to
-                // the §5 offscreen model for that subset and needs no render
-                // target. Anything else — `blur()`, `drop-shadow()`,
-                // `opacity()`, `url()` — stays on the `Filter` graph.
+                // Seven shorthand filter functions reduce to alpha-preserving
+                // colour matrices. The CPU path records and rasterises their
+                // subtree before applying the matrix to the composited pixels;
+                // anything spatial or alpha-changing stays on the Filter graph.
                 let color_matrix = ColorMatrixChain::from_filters(&effects.filter.0);
                 let filter = if color_matrix.is_some() {
                     None
@@ -508,18 +505,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // Clipped to border-box as it needs to include the background and borders.
                 self.layer_manager.maybe_with_layer(
                     scene,
-                    has_opacity || filter.is_some() || backdrop_filter.is_some(),
+                    has_opacity
+                        || color_matrix.is_some()
+                        || filter.is_some()
+                        || backdrop_filter.is_some(),
                     opacity,
                     cx.transform,
                     &effect_layer_clip,
                     filter,
                     backdrop_filter,
                     |scene| match &color_matrix {
-                        // Filter Effects 1 §5: the element and its descendants
-                        // "are rendered together as a group with the filter
-                        // effect applied to the group as a whole". The recording
-                        // is that group's buffer; the chain filters it before it
-                        // is composited into the parent scene.
                         Some(chain) => {
                             let mut group = Scene::default();
                             cx.paint_effect_layer_contents(
@@ -530,8 +525,33 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 child_clip_rect,
                                 unscrolled_transform,
                             );
-                            chain.apply_to_scene(&mut group);
-                            scene.append_scene(group, Affine::IDENTITY);
+
+                            #[cfg(feature = "vello-cpu-filters")]
+                            {
+                                let surface = Rect::from_origin_size(
+                                    (cx.initial_x, cx.initial_y),
+                                    (f64::from(cx.width), f64::from(cx.height)),
+                                );
+                                let bounds = cx
+                                    .transform
+                                    .transform_rect_bbox(effect_layer_clip)
+                                    .intersect(surface);
+                                match chain.rasterize_composited_scene(group, bounds) {
+                                    Ok((image, transform)) => {
+                                        scene.draw_image(image.as_ref(), transform);
+                                    }
+                                    Err(mut group) => {
+                                        chain.apply_to_scene(&mut group);
+                                        scene.append_scene(group, Affine::IDENTITY);
+                                    }
+                                }
+                            }
+
+                            #[cfg(not(feature = "vello-cpu-filters"))]
+                            {
+                                chain.apply_to_scene(&mut group);
+                                scene.append_scene(group, Affine::IDENTITY);
+                            }
                         }
                         None => cx.paint_effect_layer_contents(
                             scene,
