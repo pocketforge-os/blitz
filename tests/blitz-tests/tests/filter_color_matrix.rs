@@ -22,20 +22,24 @@ const W: u32 = 40;
 const H: u32 = 40;
 
 fn render(body: &str) -> Vec<u8> {
+    render_sized(body, W, H)
+}
+
+fn render_sized(body: &str, width: u32, height: u32) -> Vec<u8> {
     let html = format!(r#"<html><body style="margin:0; background:#ffffff;">{body}</body></html>"#);
     let mut doc = HtmlDocument::from_html(
         &html,
         DocumentConfig {
-            viewport: Some(Viewport::new(W, H, 1.0, ColorScheme::Light)),
+            viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
             html_parser_provider: Some(Arc::new(HtmlProvider) as _),
             ..Default::default()
         },
     );
     doc.resolve(0.0);
     render_to_buffer::<VelloCpuImageRenderer, _>(
-        |scene| paint_scene(scene, doc.as_mut(), 1.0, W, H, 0, 0),
-        W,
-        H,
+        |scene| paint_scene(scene, doc.as_mut(), 1.0, width, height, 0, 0),
+        width,
+        height,
     )
 }
 
@@ -54,7 +58,11 @@ fn document(body: &str, width: u32, height: u32) -> HtmlDocument {
 }
 
 fn pixel(buf: &[u8], x: u32, y: u32) -> [u8; 3] {
-    let i = ((y * W + x) * 4) as usize;
+    pixel_in(buf, W, x, y)
+}
+
+fn pixel_in(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+    let i = ((y * width + x) * 4) as usize;
     [buf[i], buf[i + 1], buf[i + 2]]
 }
 
@@ -187,6 +195,68 @@ fn ancestor_invert_preserves_and_filters_a_descendant_drop_shadow() {
         [0, 255, 255],
         "descendant drop shadow after ancestor invert(1)",
     );
+}
+
+/// The portion of a source beyond the surface can still cast a blurred shadow
+/// into the visible output. The larger render is the unclipped reference;
+/// cropping its left 40 pixels must equal the direct 40-pixel surface render.
+#[test]
+fn nested_drop_shadow_reads_source_beyond_the_surface_edge() {
+    let body = r#"<div style="position:relative; width:80px; height:40px;
+            background:#000; filter:invert(1)">
+        <div style="position:absolute; left:38px; top:14px; width:8px; height:12px;
+            background:#000; filter:drop-shadow(-5px 0 3px #ff0000)"></div>
+    </div>"#;
+    let clipped = render_sized(body, 40, 40);
+    let reference = render_sized(body, 80, 40);
+
+    assert_ne!(
+        pixel_in(&reference, 80, 34, 20),
+        [255, 255, 255],
+        "reference edge pixel must contain the inverted shadow"
+    );
+    for x in [34, 36, 38, 39] {
+        assert_close(
+            pixel_in(&clipped, 40, x, 20),
+            pixel_in(&reference, 80, x, 20),
+            "drop shadow just inside the surface edge",
+        );
+    }
+}
+
+/// An ancestor overflow clip applies after the descendant blur. Pixels outside
+/// the clip still contribute to blur samples just inside it. Expanding the
+/// reference clip exposes those source pixels, after which cropping at x=40
+/// must reproduce the clipped scene's inside-edge pixels.
+#[test]
+fn nested_blur_reads_source_beyond_an_ancestor_clip_edge() {
+    let scene = |clip_width: u32| {
+        format!(
+            r#"<div style="width:{clip_width}px; height:40px; overflow:hidden">
+                <div style="position:relative; width:80px; height:40px;
+                        background:#000; filter:invert(1)">
+                    <div style="position:absolute; left:38px; top:14px;
+                        width:8px; height:12px; background:#ff0000;
+                        filter:blur(3px)"></div>
+                </div>
+            </div>"#
+        )
+    };
+    let clipped = render_sized(&scene(40), 80, 40);
+    let reference = render_sized(&scene(80), 80, 40);
+
+    assert_ne!(
+        pixel_in(&reference, 80, 38, 20),
+        [255, 255, 255],
+        "reference edge pixel must contain the inverted blur"
+    );
+    for x in [35, 37, 38, 39] {
+        assert_close(
+            pixel_in(&clipped, 80, x, 20),
+            pixel_in(&reference, 80, x, 20),
+            "blur just inside the ancestor clip edge",
+        );
+    }
 }
 
 /// This is the real nested colour-filter shape: a clamp-capable descendant

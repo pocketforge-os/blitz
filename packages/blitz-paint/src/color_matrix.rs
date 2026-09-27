@@ -707,19 +707,40 @@ impl ColorMatrixChain {
                         continue;
                     };
 
-                    let layer_bounds = visible_bounds.intersect(
-                        layer
-                            .transform
-                            .transform_rect_bbox(layer.clip.bounding_box()),
-                    );
-                    if layer_bounds.width() <= 0.0 || layer_bounds.height() <= 0.0 {
+                    let layer_region = layer
+                        .transform
+                        .transform_rect_bbox(layer.clip.bounding_box());
+                    let output_bounds = visible_bounds.intersect(layer_region);
+                    if output_bounds.width() <= 0.0 || output_bounds.height() <= 0.0 {
                         continue;
                     }
 
-                    // Clip the source before filtering, as the backend's
-                    // filtered layer would. Keep the original layer around the
-                    // replacement too so its opacity, blend, and output clip
-                    // remain in their original compositing position.
+                    let vello_filter = convert_single_node_filter(&filter)
+                        .expect("scene raster eligibility validated this filter primitive");
+                    // Vello's source reach is zero for flood, ±3σ for blur,
+                    // the union of the original source and (-offset ± 3σ) for
+                    // drop-shadow, and the inverse offset for offset. Its API
+                    // applies the layer's linear transform to that reach.
+                    let input_reach = vello_filter.source_expansion(&layer.transform);
+                    let input_bounds = Rect::new(
+                        output_bounds.x0 + input_reach.x0,
+                        output_bounds.y0 + input_reach.y0,
+                        output_bounds.x1 + input_reach.x1,
+                        output_bounds.y1 + input_reach.y1,
+                    )
+                    .intersect(layer_region);
+                    if input_bounds.width() <= 0.0 || input_bounds.height() <= 0.0 {
+                        continue;
+                    }
+
+                    // The final output is restricted to `output_bounds`, but a
+                    // spatial filter can read source pixels beyond that clip.
+                    // Rasterise only the directional input reach declared by
+                    // the pinned Vello primitive, bounded by the layer's own
+                    // filter region. The enclosing group pass crops the result
+                    // back to its visible output rectangle. Keep the original
+                    // layer too so opacity, blend, and its output clip remain
+                    // in their original compositing position.
                     let mut source_commands = Vec::with_capacity(body.len() + 2);
                     source_commands.push(RenderCommand::PushClipLayer(
                         anyrender::recording::ClipCommand {
@@ -734,10 +755,10 @@ impl ColorMatrixChain {
                         commands: source_commands,
                     };
                     let (source, placement) =
-                        Self::rasterize_scene_image(source_scene, layer_bounds)
-                            .expect("nested filter bounds were validated from the outer pass");
-                    let filtered = Self::apply_single_threaded_filter(source, &filter)
-                        .expect("scene raster eligibility validated this filter primitive");
+                        Self::rasterize_scene_image(source_scene, input_bounds)
+                            .expect("nested filter input bounds were validated");
+                    let filtered =
+                        Self::apply_single_threaded_filter(source, vello_filter, layer.transform);
 
                     resolved.push(RenderCommand::PushLayer(layer));
                     let image_rect = Rect::new(
@@ -827,10 +848,15 @@ impl ColorMatrixChain {
     /// dispatcher. This remains available when Vello CPU is compiled with its
     /// `multithreading` feature; only `num_threads: 0` controls the dispatcher.
     #[cfg(feature = "vello-cpu-filters")]
-    fn apply_single_threaded_filter(image: ImageBrush, filter: &Filter) -> Option<ImageBrush> {
-        let filter = convert_single_node_filter(filter)?;
-        let width = u16::try_from(image.image.width).ok()?;
-        let height = u16::try_from(image.image.height).ok()?;
+    fn apply_single_threaded_filter(
+        image: ImageBrush,
+        filter: VelloFilter,
+        filter_transform: Affine,
+    ) -> ImageBrush {
+        let width = u16::try_from(image.image.width)
+            .expect("filter input width was already limited to u16");
+        let height = u16::try_from(image.image.height)
+            .expect("filter input height was already limited to u16");
         let mut context = VelloRenderContext::new_with(
             width,
             height,
@@ -839,6 +865,7 @@ impl ColorMatrixChain {
                 ..RenderSettings::default()
             },
         );
+        context.set_transform(filter_transform);
         context.push_layer(None, None, None, None, Some(filter));
         context.set_transform(Affine::IDENTITY);
         context.set_paint(PaintType::Image(VelloImage {
@@ -853,11 +880,7 @@ impl ColorMatrixChain {
             PixmapMut::new(width, height, &mut pixels).expect("pixel buffer has exact dimensions"),
             &mut Resources::new(),
         );
-        Some(Self::image_brush(
-            pixels,
-            u32::from(width),
-            u32::from(height),
-        ))
+        Self::image_brush(pixels, u32::from(width), u32::from(height))
     }
 
     fn apply(&self, color: Color) -> Color {
