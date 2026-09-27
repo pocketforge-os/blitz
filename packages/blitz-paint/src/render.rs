@@ -480,9 +480,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     convert_filters(&effects.filter.0).map(Arc::new)
                 };
                 let color_matrix = color_matrix.filter(|chain| !chain.is_identity());
-                let color_matrix_needs_group = color_matrix
-                    .as_ref()
-                    .is_some_and(|chain| !chain.can_rewrite_paints_exactly());
                 let backdrop_filter = convert_filters(&effects.backdrop_filter.0).map(Arc::new);
 
                 // Adjust effect layer clip by filter expansion area
@@ -498,20 +495,25 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .map(|f| f.expansion_rect())
                     .unwrap_or(Rect::ZERO);
 
-                let mut effect_layer_clip = cx.frame.border_box_path().bounding_box();
+                // Isolation is not itself an overflow clip. Use the subtree's
+                // layout overflow unless this element independently clips its
+                // contents; clip-path is applied by the outer layer above.
+                let border_box = cx.frame.border_box_path().bounding_box();
+                let mut effect_layer_clip = if should_clip {
+                    border_box
+                } else {
+                    overflow.union(border_box)
+                };
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
                 effect_layer_clip.y1 += filter_expansion_area.y1;
 
-                // Opacity/Filter layer if box has opacity or a filter.
-                // Clipped to border-box as it needs to include the background and borders.
+                // Opacity/backend-filter isolation. The clip is the independently
+                // clipped border box or the visible subtree overflow computed above.
                 self.layer_manager.maybe_with_layer(
                     scene,
-                    has_opacity
-                        || color_matrix_needs_group
-                        || filter.is_some()
-                        || backdrop_filter.is_some(),
+                    has_opacity || filter.is_some() || backdrop_filter.is_some(),
                     opacity,
                     cx.transform,
                     &effect_layer_clip,
@@ -534,7 +536,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             // colour map commutes with source-over. Rewriting the
                             // recorded paints is then exact and avoids a pixel
                             // round trip through an offscreen buffer.
-                            if chain.can_rewrite_paints_exactly() {
+                            if chain.can_rewrite_scene_exactly(&group) {
                                 chain.apply_to_scene(&mut group);
                                 scene.append_scene(group, Affine::IDENTITY);
                                 return;
@@ -546,9 +548,27 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                     (cx.initial_x, cx.initial_y),
                                     (f64::from(cx.width), f64::from(cx.height)),
                                 );
-                                let bounds = cx
-                                    .transform
-                                    .transform_rect_bbox(effect_layer_clip)
+                                let layout_bounds =
+                                    cx.transform.transform_rect_bbox(overflow.union(border_box));
+                                let mut bounds =
+                                    ColorMatrixChain::recorded_visual_bounds(&group, layout_bounds);
+
+                                // Overflow and clip-path clip independently of
+                                // filtering. The offscreen buffer may include
+                                // visible descendant ink only when those rules
+                                // permit it.
+                                if should_clip {
+                                    bounds = bounds
+                                        .intersect(cx.transform.transform_rect_bbox(border_box));
+                                }
+                                if has_clip_path {
+                                    bounds =
+                                        bounds.intersect(cx.transform.transform_rect_bbox(
+                                            clip_path_for_layer.bounding_box(),
+                                        ));
+                                }
+
+                                bounds = bounds
                                     .intersect(surface)
                                     // `clip_rect` is in viewport coordinates;
                                     // the recorded scene uses device coordinates

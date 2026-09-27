@@ -52,6 +52,9 @@
 //! an opaque group's output colour is a weighted average of its sources and the
 //! weights sum to one. All eight cube vertices are propagated through every
 //! stage because an affine function reaches its extrema over a cube at a vertex.
+//! The recorded scene is then inspected too: descendant filter/backdrop graphs,
+//! non-standard blends, backend resource/custom paints, and gradients outside
+//! sRGB interpolation force the composited-group path.
 //!
 //! The pinned Vello CPU renderer does not execute colour-matrix primitives and
 //! its multithreaded dispatcher rejects every filter layer, so `blitz-paint`
@@ -67,10 +70,10 @@ use anyrender::{ImageRenderer as _, PaintScene as _};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use color::{ColorSpaceTag, DynamicColor, Srgb};
 #[cfg(feature = "vello-cpu-filters")]
-use kurbo::{Affine, Rect};
+use kurbo::{Affine, Rect, Shape};
 use peniko::{
-    Blob, ColorStop, ColorStops, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
-    InterpolationAlphaSpace,
+    BlendMode, Blob, ColorStop, ColorStops, Gradient, ImageAlphaType, ImageBrush, ImageData,
+    ImageFormat, InterpolationAlphaSpace,
 };
 #[cfg(feature = "vello-cpu-filters")]
 use peniko::{Extend, ImageQuality, ImageSampler};
@@ -404,6 +407,119 @@ impl ColorMatrixChain {
         true
     }
 
+    /// Whether every colour-bearing operation in `scene` is covered by
+    /// [`Self::apply_to_scene`]. Matrix eligibility alone is insufficient: a
+    /// descendant filter or non-standard blend operates on completed pixels,
+    /// while resource/custom paints have no bytes this crate can rewrite.
+    pub(crate) fn can_rewrite_scene_exactly(&self, scene: &Scene) -> bool {
+        self.can_rewrite_paints_exactly()
+            && scene.commands.iter().all(|command| match command {
+                RenderCommand::Fill(command) => self.can_rewrite_paint_exactly(&command.brush),
+                RenderCommand::Stroke(command) => self.can_rewrite_paint_exactly(&command.brush),
+                RenderCommand::GlyphRun(command) => self.can_rewrite_paint_exactly(&command.brush),
+                RenderCommand::BoxShadow(_) | RenderCommand::PushClipLayer(_) => true,
+                RenderCommand::PushLayer(command) => {
+                    command.blend == BlendMode::default()
+                        && command.filter.is_none()
+                        && command.backdrop_filter.is_none()
+                }
+                RenderCommand::PopLayer => true,
+            })
+    }
+
+    fn can_rewrite_paint_exactly(&self, paint: &Paint) -> bool {
+        match paint {
+            Paint::Solid(_) => true,
+            // `apply_to_gradient` reconstructs the per-pixel affine result for
+            // sRGB interpolation. Other interpolation spaces take its documented
+            // approximate endpoint fallback and therefore cannot use this path.
+            Paint::Gradient(gradient) => gradient.interpolation_cs == ColorSpaceTag::Srgb,
+            // Pixel rewriting covers both byte orders and both alpha encodings.
+            // Reject malformed/unknown formats rather than silently leaving data.
+            Paint::Image(brush) => {
+                matches!(brush.image.format, ImageFormat::Rgba8 | ImageFormat::Bgra8)
+                    && brush
+                        .image
+                        .format
+                        .size_in_bytes(brush.image.width, brush.image.height)
+                        .is_some_and(|size| size == brush.image.data.data().len())
+            }
+            Paint::Resource(_) | Paint::Custom(_) => false,
+        }
+    }
+
+    /// Conservative device-space ink bounds for a recorded filtered subtree.
+    ///
+    /// `layout_bounds` supplies descendant geometry (including glyph layout).
+    /// Recorded fills/strokes cover backend/custom drawing outside that geometry;
+    /// box shadows and filtered layer clips add the effect expansion that layout
+    /// overflow does not know about.
+    #[cfg(feature = "vello-cpu-filters")]
+    pub(crate) fn recorded_visual_bounds(scene: &Scene, layout_bounds: Rect) -> Rect {
+        scene
+            .commands
+            .iter()
+            .fold(layout_bounds, |bounds, command| {
+                let command_bounds = match command {
+                    RenderCommand::Fill(command) => Some(
+                        command
+                            .transform
+                            .transform_rect_bbox(command.shape.bounding_box()),
+                    ),
+                    RenderCommand::Stroke(command) => {
+                        let inflation =
+                            command.style.width * command.style.miter_limit.max(1.0) * 0.5;
+                        Some(command.transform.transform_rect_bbox(
+                            command.shape.bounding_box().inflate(inflation, inflation),
+                        ))
+                    }
+                    RenderCommand::GlyphRun(command) => {
+                        let mut glyphs = command.glyphs.iter();
+                        glyphs.next().map(|first| {
+                            let mut glyph_bounds = Rect::new(
+                                f64::from(first.x),
+                                f64::from(first.y),
+                                f64::from(first.x),
+                                f64::from(first.y),
+                            );
+                            for glyph in glyphs {
+                                let point =
+                                    kurbo::Point::new(f64::from(glyph.x), f64::from(glyph.y));
+                                glyph_bounds = glyph_bounds.union_pt(point);
+                            }
+                            let pad = f64::from(command.font_size) * 1.5
+                                + command.embolden.x.abs()
+                                + command.embolden.y.abs();
+                            command
+                                .transform
+                                .transform_rect_bbox(glyph_bounds.inflate(pad, pad))
+                        })
+                    }
+                    RenderCommand::BoxShadow(command) => {
+                        let pad = command.std_dev * 3.0;
+                        Some(
+                            command
+                                .transform
+                                .transform_rect_bbox(command.rect.inflate(pad, pad)),
+                        )
+                    }
+                    RenderCommand::PushLayer(command)
+                        if command.filter.is_some() || command.backdrop_filter.is_some() =>
+                    {
+                        Some(
+                            command
+                                .transform
+                                .transform_rect_bbox(command.clip.bounding_box()),
+                        )
+                    }
+                    RenderCommand::PushLayer(_)
+                    | RenderCommand::PushClipLayer(_)
+                    | RenderCommand::PopLayer => None,
+                };
+                command_bounds.map_or(bounds, |command_bounds| bounds.union(command_bounds))
+            })
+    }
+
     fn apply(&self, color: Color) -> Color {
         self.0.iter().fold(color, |acc, m| m.apply(acc))
     }
@@ -517,7 +633,8 @@ impl ColorMatrixChain {
         }
     }
 
-    /// Compatibility fallback for a backend without an offscreen pass.
+    /// Exact paint rewrite for a clamp-free, fully supported recorded scene, or
+    /// compatibility fallback for a backend without an offscreen pass.
     ///
     /// This rewrites individual paints and therefore cannot reproduce a clamp
     /// that occurs after translucent sources have composited. The Vello CPU
@@ -532,9 +649,9 @@ impl ColorMatrixChain {
                 RenderCommand::Stroke(cmd) => self.apply_to_paint(&mut cmd.brush),
                 RenderCommand::GlyphRun(cmd) => self.apply_to_paint(&mut cmd.brush),
                 RenderCommand::BoxShadow(cmd) => cmd.brush = self.apply(cmd.brush),
-                // A nested layer carries no colour of its own: its blend mode,
-                // group alpha and clip are all alpha-domain, and any nested
-                // `filter` on it is a graph this chain deliberately does not own.
+                // Eligibility rejects nested filters and non-standard blends;
+                // default source-over layers, group alpha and clips carry no
+                // colour of their own.
                 RenderCommand::PushLayer(_)
                 | RenderCommand::PushClipLayer(_)
                 | RenderCommand::PopLayer => {}
@@ -547,9 +664,8 @@ impl ColorMatrixChain {
             Paint::Solid(color) => *color = self.apply(*color),
             Paint::Gradient(gradient) => self.apply_to_gradient(gradient),
             Paint::Image(brush) => self.apply_to_image(brush),
-            // A backend-owned paint whose pixels this crate cannot see. Leaving
-            // it alone is wrong, but inventing a colour for it would be worse;
-            // `blitz-paint` never emits either variant today.
+            // Eligibility rejects backend-owned paints whose pixels this crate
+            // cannot see. Keep these arms defensive for compatibility callers.
             Paint::Resource(_) | Paint::Custom(_) => {}
         }
     }
@@ -810,7 +926,7 @@ mod tests {
     #[cfg(feature = "vello-cpu-filters")]
     use kurbo::{Circle, Rect};
     #[cfg(feature = "vello-cpu-filters")]
-    use peniko::Fill;
+    use peniko::{Fill, Mix};
 
     fn rgb(color: Color) -> [u8; 3] {
         let c = color.to_rgba8();
@@ -948,6 +1064,55 @@ mod tests {
                 "expected a potentially clamping chain: {chain:?}"
             );
         }
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    #[test]
+    fn ancestor_invert_routes_a_descendant_drop_shadow_through_the_group_path() {
+        let chain = ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::invert(1.0)]));
+        assert!(chain.can_rewrite_paints_exactly());
+
+        let red = Color::from_rgb8(255, 0, 0);
+        let mut scene = Scene::default();
+        scene.push_layer(
+            Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &Rect::new(0.0, 0.0, 32.0, 32.0),
+            Some(Arc::new(anyrender::Filter::single(
+                anyrender::filters::FilterEffect::drop_shadow(8.0, 0.0, 0.0, red),
+            ))),
+            None,
+        );
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::BLACK,
+            None,
+            &Rect::new(2.0, 2.0, 10.0, 10.0),
+        );
+        scene.pop_layer();
+
+        assert!(
+            !chain.can_rewrite_scene_exactly(&scene),
+            "the ancestor must filter the completed descendant shadow"
+        );
+
+        // The rejected paint rewrite demonstrates the bug this gate prevents:
+        // it changes the fill but leaves the filter graph's red flood metadata
+        // untouched, while filtering the completed group maps red to cyan.
+        let mut paint_rewritten = scene;
+        chain.apply_to_scene(&mut paint_rewritten);
+        let RenderCommand::PushLayer(layer) = &paint_rewritten.commands[0] else {
+            panic!("expected the descendant filter layer");
+        };
+        let anyrender::filters::FilterEffect::DropShadow(shadow) =
+            &layer.filter.as_ref().expect("drop-shadow filter").nodes()[0].effect
+        else {
+            panic!("expected a drop-shadow primitive");
+        };
+        assert_eq!(rgb(shadow.color), [255, 0, 0]);
+        assert_eq!(rgb(chain.apply(shadow.color)), [0, 255, 255]);
     }
 
     /// A deterministic generator is enough here: this is a renderer invariant,
@@ -1094,6 +1259,35 @@ mod tests {
                 }
             }
         }
+
+        let mut filtered_layer = randomized_scene(0x5eed_182);
+        filtered_layer.push_layer(
+            Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &Rect::new(8.0, 8.0, 56.0, 56.0),
+            Some(Arc::new(anyrender::Filter::single(
+                anyrender::filters::FilterEffect::drop_shadow(
+                    4.0,
+                    0.0,
+                    0.0,
+                    Color::from_rgb8(255, 0, 0),
+                ),
+            ))),
+            None,
+        );
+        filtered_layer.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::BLACK,
+            None,
+            &Rect::new(12.0, 12.0, 24.0, 24.0),
+        );
+        filtered_layer.pop_layer();
+        assert!(
+            !chains[0].can_rewrite_scene_exactly(&filtered_layer),
+            "a descendant layer filter must force the ancestor onto the group path"
+        );
     }
 
     /// Evaluate a stop list the way `vello_common::encode::encode_stops` does

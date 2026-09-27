@@ -257,6 +257,57 @@ fn contrast_clamps_below_zero_after_translucent_compositing() {
     );
 }
 
+/// A filter establishes a group, not an overflow clip. Descendant ink outside
+/// the filtered element's border box remains visible when overflow is visible,
+/// and the ancestor filter applies to that ink.
+#[test]
+fn a_group_filter_preserves_visible_descendant_overflow() {
+    let body = r#"<div style="position:relative; width:10px; height:10px;
+            overflow:visible; filter:brightness(2)">
+        <div style="position:absolute; left:20px; top:0; width:10px; height:10px;
+            background:#404040"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 25, 5),
+        [128, 128, 128],
+        "filtered descendant outside a visible-overflow border box",
+    );
+}
+
+/// Descendant ink overflow includes effects that layout overflow alone does not
+/// know about. The outer filter must retain and transform that effect too.
+#[test]
+fn a_group_filter_bounds_visible_descendant_effect_overflow() {
+    let body = r#"<div style="position:relative; width:5px; height:5px;
+            overflow:visible; filter:brightness(2)">
+        <div style="position:absolute; left:10px; top:0; width:5px; height:5px;
+            box-shadow:10px 0 0 #404040"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 22, 2),
+        [128, 128, 128],
+        "filtered descendant effect outside layout overflow",
+    );
+}
+
+/// The same geometry remains clipped when overflow independently requires it.
+#[test]
+fn a_group_filter_keeps_hidden_descendant_overflow_clipped() {
+    let body = r#"<div style="position:relative; width:10px; height:10px;
+            overflow:hidden; filter:brightness(2)">
+        <div style="position:absolute; left:20px; top:0; width:10px; height:10px;
+            background:#404040"></div>
+    </div>"#;
+    let buf = render(body);
+    assert_close(
+        pixel(&buf, 25, 5),
+        [255, 255, 255],
+        "hidden overflow outside a filtered border box",
+    );
+}
+
 /// Element opacity multiplies the already-filtered group, so a black
 /// result at 50% over white is mid grey either way -- but an implementation
 /// that filtered *after* opacity would lift the black towards the backdrop
