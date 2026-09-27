@@ -120,6 +120,16 @@ fn hue_rotate_zero_is_byte_identical_to_no_filter() {
     assert_eq!(filtered, plain, "hue-rotate(0deg) changed the frame");
 }
 
+#[test]
+fn composed_identity_chain_is_byte_identical_to_no_filter() {
+    let filtered = render(&block(
+        "filter: hue-rotate(0deg) brightness(1) contrast(1) saturate(1) invert(0) sepia(0) grayscale(0);",
+        "#8040c0",
+    ));
+    let plain = render(&block("", "#8040c0"));
+    assert_eq!(filtered, plain, "identity filter chain changed the frame");
+}
+
 /// `type="hueRotate"` at 90 degrees: `cos = 0`, `sin = 1`, so the matrix
 /// is the constant term plus the sin term, e.g. the red row becomes
 /// `(0.213 - 0.213, 0.715 - 0.715, 0.072 + 0.928) = (0, 0, 1)`.
@@ -541,6 +551,7 @@ fn filtered_subtree_frame_cost_1280x720() {
             <path d="M26 14 L42 36 L18 36 Z" fill="#f7f7f7"/>
         </svg>
     </main>"##;
+    let focused_icon_unfiltered = focused_icon.replace("filter:brightness(.55) contrast(1.2)", "");
 
     let inverted_desktop_with_nested_effects = r##"<main style="width:1280px; height:720px;
             background:#246; padding:52px; filter:invert(1)">
@@ -577,12 +588,18 @@ fn filtered_subtree_frame_cost_1280x720() {
         </div>
     </main>"#;
 
+    let only = std::env::var("BLITZ_FILTER_BENCH_ONLY").ok();
     for (name, body) in [
         ("full_screen_invert", full_screen_scene("filter:invert(1);")),
+        ("focused_icon_48x48_unfiltered", focused_icon_unfiltered),
         ("focused_icon_48x48", focused_icon.to_owned()),
         (
             "full_screen_invert_with_nested_icon_and_box_shadow",
             inverted_desktop_with_nested_effects.to_owned(),
+        ),
+        (
+            "photo_1218x200_unfiltered",
+            photo(0).replace("filter:hue-rotate(0deg);", ""),
         ),
         ("photo_1218x200_hue_rotate_0", photo(0)),
         ("photo_1218x200_hue_rotate_61", photo(61)),
@@ -593,6 +610,9 @@ fn filtered_subtree_frame_cost_1280x720() {
         ),
         ("tuning_partially_clipped_hue_rotate", clipped.to_owned()),
     ] {
+        if only.as_deref().is_some_and(|only| only != name) {
+            continue;
+        }
         let mut doc = document(&body, WIDTH, HEIGHT);
         let mut renderer = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
         let mut buffer = Vec::new();
