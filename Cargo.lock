@@ -1036,6 +1036,7 @@ dependencies = [
  "kurbo",
  "parley",
  "peniko",
+ "rayon",
  "skrifa",
  "smallvec",
  "stylo",

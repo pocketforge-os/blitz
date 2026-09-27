@@ -84,6 +84,8 @@ use peniko::{
 };
 #[cfg(feature = "vello-cpu-filters")]
 use peniko::{Extend, ImageQuality, ImageSampler};
+#[cfg(feature = "vello-cpu-filters")]
+use rayon::prelude::*;
 use smallvec::SmallVec;
 #[cfg(feature = "vello-cpu-filters")]
 use std::cell::RefCell;
@@ -125,6 +127,13 @@ thread_local! {
     /// Keep one renderer's scratch allocations warm without retaining one
     /// framebuffer for every distinct animated element size ever observed.
     static FILTER_RENDERER: RefCell<Option<(u32, u32, VelloCpuImageRenderer)>> =
+        const { RefCell::new(None) };
+
+    /// Small groups are faster on Vello's single-thread dispatcher: waking
+    /// and synchronising the worker pool costs much more than rasterising a
+    /// handful of paths. Keep that dispatcher's allocations warm separately
+    /// from the general AnyRender adapter above.
+    static SMALL_FILTER_RENDERER: RefCell<Option<(u32, u32, VelloRenderContext, Resources)>> =
         const { RefCell::new(None) };
 }
 
@@ -891,6 +900,81 @@ impl ColorMatrixChain {
         DynamicColor::from_alpha_color(self.apply(color.to_alpha_color::<Srgb>()))
     }
 
+    /// Whether a small recorded group can bypass the build-wide
+    /// multithreaded AnyRender adapter. The direct Vello replay is deliberately
+    /// limited to solid fills, the exact shape of the focused SVG exposure.
+    /// Every other command stays on the general renderer, which owns its image,
+    /// glyph, layer, and filter machinery.
+    #[cfg(feature = "vello-cpu-filters")]
+    fn can_rasterize_small_group_single_threaded(scene: &Scene) -> bool {
+        scene.commands.iter().all(|command| {
+            matches!(
+                command,
+                RenderCommand::Fill(command) if matches!(&command.brush, Paint::Solid(_))
+            )
+        })
+    }
+
+    /// Replay a small, validated solid-fill scene through Vello's
+    /// single-thread dispatcher. This mirrors
+    /// `anyrender_vello_cpu::VelloCpuScenePainter` for that command.
+    #[cfg(feature = "vello-cpu-filters")]
+    fn rasterize_small_group_single_threaded(
+        scene: Scene,
+        width: u32,
+        height: u32,
+        offset: Affine,
+    ) -> Vec<u8> {
+        SMALL_FILTER_RENDERER.with(|cached| {
+            let (mut renderer, mut resources) = cached
+                .borrow_mut()
+                .take()
+                .filter(|(cached_width, cached_height, _, _)| {
+                    *cached_width == width && *cached_height == height
+                })
+                .map(|(_, _, renderer, resources)| (renderer, resources))
+                .unwrap_or_else(|| {
+                    (
+                        VelloRenderContext::new_with(
+                            width as u16,
+                            height as u16,
+                            RenderSettings {
+                                num_threads: 0,
+                                ..RenderSettings::default()
+                            },
+                        ),
+                        Resources::new(),
+                    )
+                });
+            renderer.reset();
+
+            for command in scene.commands {
+                let RenderCommand::Fill(command) = command else {
+                    unreachable!("small-group command eligibility was checked")
+                };
+                let Paint::Solid(color) = command.brush else {
+                    unreachable!("small-group paint eligibility was checked")
+                };
+                renderer.set_transform(offset * command.transform);
+                renderer.set_fill_rule(command.fill);
+                renderer.set_paint(PaintType::Solid(color));
+                renderer.set_paint_transform(command.brush_transform.unwrap_or(Affine::IDENTITY));
+                renderer.fill_path(&command.shape);
+            }
+
+            let mut pixels = vec![0; width as usize * height as usize * 4];
+            renderer.render(
+                PixmapMut::new(width as u16, height as u16, &mut pixels)
+                    .expect("small-group pixel buffer has exact dimensions"),
+                &mut resources,
+            );
+            cached
+                .borrow_mut()
+                .replace((width, height, renderer, resources));
+            pixels
+        })
+    }
+
     /// Rasterise the recorded subtree, apply this chain once to its composited
     /// premultiplied pixels, and return an image placed in device space.
     ///
@@ -928,24 +1012,31 @@ impl ColorMatrixChain {
         #[cfg(test)]
         let offscreen_start = Instant::now();
         let scene = Self::resolve_nested_filter_layers(scene, bounds);
-        let mut renderer = FILTER_RENDERER
-            .with(|cached| cached.borrow_mut().take())
-            .filter(|(cached_width, cached_height, _)| {
-                *cached_width == width && *cached_height == height
-            })
-            .map(|(_, _, renderer)| renderer)
-            .unwrap_or_else(|| VelloCpuImageRenderer::new(width, height));
-        renderer.reset();
-        let mut pixels = Vec::new();
-        renderer.render_to_vec(
-            move |target| target.append_scene(scene, offset),
-            &mut pixels,
-        );
+        let small_group = width.saturating_mul(height) <= 128 * 128
+            && Self::can_rasterize_small_group_single_threaded(&scene);
+        let mut pixels = if small_group {
+            Self::rasterize_small_group_single_threaded(scene, width, height, offset)
+        } else {
+            let mut renderer = FILTER_RENDERER
+                .with(|cached| cached.borrow_mut().take())
+                .filter(|(cached_width, cached_height, _)| {
+                    *cached_width == width && *cached_height == height
+                })
+                .map(|(_, _, renderer)| renderer)
+                .unwrap_or_else(|| VelloCpuImageRenderer::new(width, height));
+            renderer.reset();
+            let mut pixels = Vec::new();
+            renderer.render_to_vec(
+                move |target| target.append_scene(scene, offset),
+                &mut pixels,
+            );
+            FILTER_RENDERER.with(|cached| {
+                cached.borrow_mut().replace((width, height, renderer));
+            });
+            pixels
+        };
         #[cfg(test)]
         let offscreen_render = offscreen_start.elapsed();
-        FILTER_RENDERER.with(|cached| {
-            cached.borrow_mut().replace((width, height, renderer));
-        });
         #[cfg(test)]
         let matrix_start = Instant::now();
         self.apply_to_premultiplied_rgba8(&mut pixels);
@@ -977,23 +1068,103 @@ impl ColorMatrixChain {
 
     #[cfg(feature = "vello-cpu-filters")]
     fn apply_to_premultiplied_rgba8(&self, pixels: &mut [u8]) {
+        const PARALLEL_THRESHOLD: usize = 256 * 1024;
+        const PARALLEL_CHUNK: usize = 512 * 1024;
+        if pixels.len() >= PARALLEL_THRESHOLD {
+            pixels
+                .par_chunks_mut(PARALLEL_CHUNK)
+                .for_each(|chunk| self.apply_to_premultiplied_rgba8_serial(chunk));
+        } else {
+            self.apply_to_premultiplied_rgba8_serial(pixels);
+        }
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    fn apply_to_premultiplied_rgba8_serial(&self, pixels: &mut [u8]) {
+        let (blocks, tail) = pixels.as_chunks_mut::<64>();
+        for block in blocks {
+            if block.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255) {
+                self.apply_to_opaque_rgba8_block(block);
+            } else {
+                for pixel in block.as_chunks_mut::<4>().0 {
+                    self.apply_to_premultiplied_rgba8_pixel(pixel);
+                }
+            }
+        }
+        for pixel in tail.as_chunks_mut::<4>().0 {
+            self.apply_to_premultiplied_rgba8_pixel(pixel);
+        }
+    }
+
+    /// Process sixteen opaque texels in planar arrays. Keeping the dynamic
+    /// matrix-chain loop outside the fixed-size texel loop gives LLVM a simple
+    /// straight-line lane loop to vectorise on both x86_64 and aarch64. Values
+    /// stay in byte scale, with the same ordered per-stage clamps; the
+    /// randomized reference test pins the resulting bytes exactly.
+    #[cfg(feature = "vello-cpu-filters")]
+    #[inline]
+    fn apply_to_opaque_rgba8_block(&self, pixels: &mut [u8; 64]) {
+        let mut red = [0.0_f32; 16];
+        let mut green = [0.0_f32; 16];
+        let mut blue = [0.0_f32; 16];
+        for lane in 0..16 {
+            red[lane] = f32::from(pixels[lane * 4]);
+            green[lane] = f32::from(pixels[lane * 4 + 1]);
+            blue[lane] = f32::from(pixels[lane * 4 + 2]);
+        }
+
+        for matrix in &self.0 {
+            let m = &matrix.0;
+            let mut next_red = [0.0_f32; 16];
+            let mut next_green = [0.0_f32; 16];
+            let mut next_blue = [0.0_f32; 16];
+            for lane in 0..16 {
+                let r = red[lane];
+                let g = green[lane];
+                let b = blue[lane];
+                next_red[lane] = (m[0] * r + m[1] * g + m[2] * b + m[4] * 255.0).clamp(0.0, 255.0);
+                next_green[lane] =
+                    (m[5] * r + m[6] * g + m[7] * b + m[9] * 255.0).clamp(0.0, 255.0);
+                next_blue[lane] =
+                    (m[10] * r + m[11] * g + m[12] * b + m[14] * 255.0).clamp(0.0, 255.0);
+            }
+            red = next_red;
+            green = next_green;
+            blue = next_blue;
+        }
+
+        for lane in 0..16 {
+            pixels[lane * 4] = (red[lane] + 0.5) as u8;
+            pixels[lane * 4 + 1] = (green[lane] + 0.5) as u8;
+            pixels[lane * 4 + 2] = (blue[lane] + 0.5) as u8;
+        }
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    #[inline]
+    fn apply_to_premultiplied_rgba8_pixel(&self, pixel: &mut [u8; 4]) {
+        let alpha_byte = usize::from(pixel[3]);
+        if alpha_byte == 0 {
+            return;
+        }
+        let alpha = alpha_byte as f32 / 255.0;
+        let unpremultiply = UNPREMULTIPLY_RGBA8[alpha_byte];
+        let source = Color::new([
+            f32::from(pixel[0]) * unpremultiply,
+            f32::from(pixel[1]) * unpremultiply,
+            f32::from(pixel[2]) * unpremultiply,
+            alpha,
+        ]);
+        let filtered = self.apply(source);
+        for (channel, value) in pixel[..3].iter_mut().zip(filtered.components[..3].iter()) {
+            *channel = (value * alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    #[cfg(all(test, feature = "vello-cpu-filters"))]
+    fn apply_to_premultiplied_rgba8_reference(&self, pixels: &mut [u8]) {
         for pixel in pixels.as_chunks_mut::<4>().0 {
-            let alpha_byte = usize::from(pixel[3]);
-            if alpha_byte == 0 {
-                continue;
-            }
-            let alpha = alpha_byte as f32 / 255.0;
-            let unpremultiply = UNPREMULTIPLY_RGBA8[alpha_byte];
-            let source = Color::new([
-                f32::from(pixel[0]) * unpremultiply,
-                f32::from(pixel[1]) * unpremultiply,
-                f32::from(pixel[2]) * unpremultiply,
-                alpha,
-            ]);
-            let filtered = self.apply(source);
-            for (channel, value) in pixel[..3].iter_mut().zip(filtered.components[..3].iter()) {
-                *channel = (value * alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            }
+            self.apply_to_premultiplied_rgba8_pixel(pixel);
         }
     }
 
@@ -1428,6 +1599,118 @@ mod tests {
                 "expected a potentially clamping chain: {chain:?}"
             );
         }
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    #[test]
+    fn vectorizable_pixel_pass_matches_scalar_reference_for_clamping_chains() {
+        fn random_u8(state: &mut u64) -> u8 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*state >> 56) as u8
+        }
+
+        let chains = [
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::brightness(1.8)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::contrast(1.2)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::saturate(2.0)])),
+            ColorMatrixChain(SmallVec::from_slice(&[ColorMatrix::hue_rotate(
+                61.0_f32.to_radians(),
+            )])),
+            ColorMatrixChain(SmallVec::from_slice(&[
+                ColorMatrix::brightness(4.0),
+                ColorMatrix::contrast(0.5),
+            ])),
+            ColorMatrixChain(SmallVec::from_slice(&[
+                ColorMatrix::sepia(1.0),
+                ColorMatrix::contrast(1.4),
+                ColorMatrix::invert(0.25),
+            ])),
+        ];
+        for chain in &chains {
+            assert!(
+                !chain.can_rewrite_paints_exactly(),
+                "reference coverage requires a clamping chain: {chain:?}"
+            );
+        }
+
+        let mut state = 0x186_f00d_5eed_u64;
+        let mut source = Vec::with_capacity(4096 * 4);
+        for pixel in 0..4096 {
+            let alpha = match pixel % 8 {
+                0 => 0,
+                1..=4 => 255,
+                _ => random_u8(&mut state),
+            };
+            for _ in 0..3 {
+                source.push(if alpha == 0 {
+                    random_u8(&mut state)
+                } else {
+                    (u16::from(random_u8(&mut state)) % (u16::from(alpha) + 1)) as u8
+                });
+            }
+            source.push(alpha);
+        }
+
+        for (chain_index, chain) in chains.iter().enumerate() {
+            let mut reference = source.clone();
+            chain.apply_to_premultiplied_rgba8_reference(&mut reference);
+            let mut optimized = source.clone();
+            chain.apply_to_premultiplied_rgba8(&mut optimized);
+            assert_eq!(
+                optimized, reference,
+                "optimized pixel pass diverged for clamping chain {chain_index}"
+            );
+        }
+    }
+
+    #[cfg(feature = "vello-cpu-filters")]
+    #[test]
+    fn small_single_thread_group_matches_general_renderer_byte_for_byte() {
+        const WIDTH: u32 = 48;
+        const HEIGHT: u32 = 48;
+
+        let mut scene = Scene::default();
+        for (color, shape) in [
+            (
+                Color::from_rgb8(239, 138, 98),
+                Rect::new(2.0, 8.0, 46.0, 42.0).to_path(0.1),
+            ),
+            (
+                Color::new([0.40, 0.66, 0.81, 0.65]),
+                Circle::new((17.0, 24.0), 9.0).to_path(0.1),
+            ),
+            (
+                Color::WHITE,
+                kurbo::BezPath::from_vec(vec![
+                    kurbo::PathEl::MoveTo((26.0, 14.0).into()),
+                    kurbo::PathEl::LineTo((42.0, 36.0).into()),
+                    kurbo::PathEl::LineTo((18.0, 36.0).into()),
+                    kurbo::PathEl::ClosePath,
+                ]),
+            ),
+        ] {
+            scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &shape);
+        }
+        assert!(ColorMatrixChain::can_rasterize_small_group_single_threaded(
+            &scene
+        ));
+
+        let mut general = VelloCpuImageRenderer::new(WIDTH, HEIGHT);
+        let mut general_pixels = Vec::new();
+        let reference = scene.clone();
+        general.render_to_vec(
+            move |target| target.append_scene(reference, Affine::IDENTITY),
+            &mut general_pixels,
+        );
+        let small_pixels = ColorMatrixChain::rasterize_small_group_single_threaded(
+            scene,
+            WIDTH,
+            HEIGHT,
+            Affine::IDENTITY,
+        );
+        assert_eq!(small_pixels, general_pixels);
     }
 
     #[cfg(feature = "vello-cpu-filters")]
@@ -1918,6 +2201,69 @@ mod tests {
             ("matrix_pass", &mut matrix),
             ("composite_back", &mut composite),
             ("total", &mut total),
+        ] {
+            let (min, median, max) = sample_stats(samples);
+            println!(
+                "FILTER_PROFILE {stage} runs={RUNS} min_ms={min:.3} median_ms={median:.3} max_ms={max:.3}"
+            );
+        }
+
+        // Attribute the fixed cost of the product's permanently visible
+        // 48x48 focused icon. Its pixel loop is too small to explain a
+        // multi-millisecond frame, so keep the offscreen and outer composite
+        // stages separate here.
+        let focused_chain = ColorMatrixChain(SmallVec::from_slice(&[
+            ColorMatrix::brightness(0.55),
+            ColorMatrix::contrast(1.2),
+        ]));
+        let mut focused_scene = Scene::default();
+        focused_scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgb8(239, 138, 98),
+            None,
+            &Rect::new(2.0, 8.0, 46.0, 42.0),
+        );
+        focused_scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::new([0.40, 0.66, 0.81, 0.65]),
+            None,
+            &Circle::new((17.0, 24.0), 9.0),
+        );
+        let focused_bounds = Rect::new(0.0, 0.0, 48.0, 48.0);
+        let mut focused_offscreen = Vec::with_capacity(RUNS);
+        let mut focused_matrix = Vec::with_capacity(RUNS);
+        let mut focused_composite = Vec::with_capacity(RUNS);
+        let mut focused_total = Vec::with_capacity(RUNS);
+        for run in 0..WARMUPS + RUNS {
+            let total_start = Instant::now();
+            let (image, transform) = focused_chain
+                .rasterize_composited_scene(focused_scene.clone(), focused_bounds)
+                .expect("the focused icon should rasterize");
+            let profile = LAST_GROUP_FILTER_PROFILE.with(|profile| *profile.borrow());
+
+            outer.reset();
+            let composite_start = Instant::now();
+            outer.render_to_vec(
+                move |target| target.draw_image(image.as_ref(), transform),
+                &mut output,
+            );
+            let composite_elapsed = composite_start.elapsed();
+            let total_elapsed = total_start.elapsed();
+
+            if run >= WARMUPS {
+                focused_offscreen.push(milliseconds(profile.offscreen_render));
+                focused_matrix.push(milliseconds(profile.matrix_pass));
+                focused_composite.push(milliseconds(composite_elapsed));
+                focused_total.push(milliseconds(total_elapsed));
+            }
+        }
+        for (stage, samples) in [
+            ("focused_offscreen_render", &mut focused_offscreen),
+            ("focused_matrix_pass", &mut focused_matrix),
+            ("focused_composite_back", &mut focused_composite),
+            ("focused_total", &mut focused_total),
         ] {
             let (min, median, max) = sample_stats(samples);
             println!(
